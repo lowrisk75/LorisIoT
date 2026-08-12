@@ -72,3 +72,25 @@ actor Counter { private(set) var value = 0; func bump() { value += 1 } }
         #expect(attempts >= 2)   // proved the silent socket was killed and reconnected
     }
 }
+
+@Suite struct RealtimeSocketClientDisconnectHookTests {
+
+    @Test func onDisconnectedFiresOnEachSessionEndBeforeBackoff() async throws {
+        // Two short sessions → the hook must fire per session end (LR-M04 disconnect edge).
+        let disconnects = Counter()
+        let config = RealtimeSocketClient<String>.Config(
+            retry: RetryPolicy(backoff: [0.02], stableSessionSeconds: 0, steadyStateSeconds: 0.02),
+            staleAfter: 5, pingEvery: 5)
+        let client = RealtimeSocketClient<String>(
+            config: config,
+            makeTransport: { MockTransport(frames: [Data("x".utf8)], endError: IoTError.cancelled) },
+            decode: { String(data: $0, encoding: .utf8) },
+            onDisconnected: { await disconnects.bump() }
+        )
+        let stream = await client.messages()
+        try await Task.sleep(for: .milliseconds(300))
+        await client.stop()
+        for await _ in stream {}
+        #expect(await disconnects.value >= 2)
+    }
+}

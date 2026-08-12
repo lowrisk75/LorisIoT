@@ -8,6 +8,13 @@ public protocol RealtimeTransport: Sendable {
     func send(_ data: Data) async throws
     func receive() async throws -> Data
     func close() async
+    /// Protocol-level keep-alive (WebSocket ping frame, MQTT PINGREQ…). Default: no-op.
+    /// Best-effort — a dead socket is detected by the watchdog's staleness check, not here.
+    func ping() async
+}
+
+public extension RealtimeTransport {
+    func ping() async {}
 }
 
 /// Generic resilient realtime client — the hardening layer every subscribe-capable provider reuses
@@ -31,6 +38,7 @@ public actor RealtimeSocketClient<Message: Sendable> {
     private let makeTransport: @Sendable () async -> RealtimeTransport
     private let decode: @Sendable (Data) -> Message?
     private let onConnected: @Sendable (RealtimeTransport) async throws -> Void   // handshake/auth + resubscribe + backfill
+    private let onDisconnected: @Sendable () async -> Void   // session ended / connect failed → entering backoff
     private let ping: @Sendable (RealtimeTransport) async -> Void          // protocol keep-alive
     private let config: Config
     private let breaker: CircuitBreaker
@@ -40,19 +48,26 @@ public actor RealtimeSocketClient<Message: Sendable> {
     private var lastActivity: Date = .distantPast
     private var continuation: AsyncStream<Message>.Continuation?
 
+    /// - Parameters:
+    ///   - onDisconnected: fires whenever an established session ends OR a connect attempt fails —
+    ///     i.e. each time the client enters backoff. Without it a consumer's "live" UI state
+    ///     latches true through an outage (Lumen LR-M04). `onConnected` re-fires on reconnect.
+    ///   - ping: keep-alive per tick; defaults to the transport's own `ping()`.
     public init(config: Config = .init(),
                 breaker: CircuitBreaker? = nil,
                 now: @escaping @Sendable () -> Date = { Date() },
                 makeTransport: @escaping @Sendable () async -> RealtimeTransport,
                 decode: @escaping @Sendable (Data) -> Message?,
                 onConnected: @escaping @Sendable (RealtimeTransport) async throws -> Void = { _ in },
-                ping: @escaping @Sendable (RealtimeTransport) async -> Void = { _ in }) {
+                onDisconnected: @escaping @Sendable () async -> Void = {},
+                ping: @escaping @Sendable (RealtimeTransport) async -> Void = { await $0.ping() }) {
         self.config = config
         self.breaker = breaker ?? CircuitBreaker(now: now)
         self.now = now
         self.makeTransport = makeTransport
         self.decode = decode
         self.onConnected = onConnected
+        self.onDisconnected = onDisconnected
         self.ping = ping
     }
 
@@ -95,6 +110,7 @@ public actor RealtimeSocketClient<Message: Sendable> {
             }
             await transport.close()
             if Task.isCancelled { break }
+            await onDisconnected()   // entering backoff — let the consumer flip "live" off (LR-M04)
             let lasted = now().timeIntervalSince(sessionStart)
             attempt = config.retry.nextAttempt(afterSessionLasting: lasted, previousAttempt: attempt)
             guard config.retry.shouldRetry(attempt: attempt) else { break }

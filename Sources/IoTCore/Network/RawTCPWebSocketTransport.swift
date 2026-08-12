@@ -235,7 +235,7 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
 
     /// Keep-alive for the `RealtimeSocketClient` ping hook. Errors are swallowed — a dead socket
     /// is detected by the watchdog's staleness check, not by ping delivery.
-    public func sendPing() async {
+    public func ping() async {
         guard let connection else { return }
         try? await NWConnectionAsync.send(connection, WebSocketFrameCodec.encodeFrame(.ping))
     }
