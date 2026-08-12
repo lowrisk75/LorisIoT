@@ -30,11 +30,16 @@ public actor ShellyProvider: DeviceProvider {
     private var configs: [DeviceID: ShellyDeviceConfig]
     private let cloud: ShellyCloudConfig?
     private let rpc: ShellyRPC
+    private let context: ExecutionContext
     private let seq = SequenceGen()
 
-    public init(devices: [ShellyDeviceConfig], cloud: ShellyCloudConfig? = nil, rpc: ShellyRPC = ShellyURLSessionRPC()) {
+    /// - Parameter context: `.systemExtension` (Widget/Siri/Control) routes control **remote-first**
+    ///   since those surfaces can't reach the LAN; `.app` is local-first.
+    public init(devices: [ShellyDeviceConfig], cloud: ShellyCloudConfig? = nil,
+                context: ExecutionContext = .app, rpc: ShellyRPC = ShellyURLSessionRPC()) {
         self.configs = Dictionary(uniqueKeysWithValues: devices.map { ($0.id, $0) })
         self.cloud = cloud
+        self.context = context
         self.rpc = rpc
     }
 
@@ -66,7 +71,7 @@ public actor ShellyProvider: DeviceProvider {
         }
         return DeviceCapabilitySet(
             descriptors: descriptors,
-            control: ShellyControlCapability(client: client, config: c, cloud: cloud, seq: seq),
+            control: ShellyControlCapability(client: client, config: c, cloud: cloud, context: context, seq: seq),
             readState: ShellyReadStateCapability(client: client, config: c, seq: seq),
             schedule: schedule)
     }
@@ -97,26 +102,37 @@ actor ShellyReadStateCapability: ReadStateCapability {
 actor ShellyControlCapability: ControlCapability {
     public nonisolated let descriptor = CapabilityDescriptor(id: .control, operations: [.control])
     private let client: ShellyClient; private let config: ShellyDeviceConfig
-    private let cloud: ShellyCloudConfig?; private let seq: SequenceGen
-    init(client: ShellyClient, config: ShellyDeviceConfig, cloud: ShellyCloudConfig?, seq: SequenceGen) {
-        self.client = client; self.config = config; self.cloud = cloud; self.seq = seq
+    private let cloud: ShellyCloudConfig?; private let context: ExecutionContext; private let seq: SequenceGen
+    init(client: ShellyClient, config: ShellyDeviceConfig, cloud: ShellyCloudConfig?, context: ExecutionContext, seq: SequenceGen) {
+        self.client = client; self.config = config; self.cloud = cloud; self.context = context; self.seq = seq
     }
 
-    /// Local-first, cloud-fallback, then confirm-by-reread. `.uncertain` when nothing could confirm.
+    private func cloudSet(_ on: Bool) async -> Bool {
+        guard let cloud, !config.mac.isEmpty else { return false }
+        return await ShellyCloudClient.setSwitch(server: cloud.server, authKey: cloud.authKey,
+                                                 deviceID: config.mac, channel: config.switchID, on: on)
+    }
+
+    /// Order local vs cloud by execution context (extension → remote-first), each falling back to the
+    /// other; then confirm-by-reread. `.uncertain` when nothing could confirm.
     func execute<C: DeviceCommand>(_ command: C) async throws -> CommandReceipt {
         guard case .setPower(let on) = command.payload else { throw IoTError.notSupported("Shelly control supports power") }
         func receipt(_ o: CommandOutcome, _ s: DeviceState?) -> CommandReceipt {
             CommandReceipt(commandID: command.id, deviceID: config.id, outcome: o, state: s)
         }
-        var sent = await client.setSwitch(id: config.switchID, on: on)   // local
-        if !sent, let cloud, !config.mac.isEmpty {                        // cloud fallback
-            sent = await ShellyCloudClient.setSwitch(server: cloud.server, authKey: cloud.authKey,
-                                                     deviceID: config.mac, channel: config.switchID, on: on)
+        var sent: Bool
+        if context.prefersRemoteTransport {                              // extension: cloud-first
+            sent = await cloudSet(on)
+            if !sent { sent = await client.setSwitch(id: config.switchID, on: on) }
+        } else {                                                         // app: local-first
+            sent = await client.setSwitch(id: config.switchID, on: on)
+            if !sent { sent = await cloudSet(on) }
         }
         guard sent else { return receipt(.uncertain, nil) }
-        let now = await client.switchState(id: config.switchID)          // confirm-by-reread
+        let now = await client.switchState(id: config.switchID)          // confirm-by-reread (local)
         let s = shellyState(now, id: config.id, seq: await seq.next())
-        if now == nil { return receipt(.uncertain, nil) }
+        // Sent OK but can't read back (off-LAN / cloud path) → accepted (not confirmed), not uncertain.
+        if now == nil { return receipt(.accepted, nil) }
         return receipt(now == on ? .applied : .rejected, s)
     }
 }
