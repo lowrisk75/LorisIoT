@@ -1,9 +1,6 @@
 import Foundation
 import IoTCore
 
-/// Monotonic local sequence for `StateRevision` (deterministic process order across capabilities).
-actor SequenceGen { private var n: UInt64 = 0; func next() -> UInt64 { n += 1; return n } }
-
 /// Home Assistant provider — the pivot integration. Exposes each HA entity as a `Device` with
 /// per-device capabilities (control/readState/subscribe, +schedule when an input_datetime helper is
 /// configured). Reaches Zigbee/Z-Wave/Thread/ESPHome/Tuya-via-HA for free.
