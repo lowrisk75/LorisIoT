@@ -21,20 +21,21 @@ Shared internal IoT framework for LorisLabs apps (Velya · Éclair · Lumen · P
 Model = capability-discovery (`DeviceProvider.capabilities(for:)` → `DeviceCapabilitySet` with typed
 Control/ReadState/Schedule/Subscribe capability actors), typed IDs, closed `StateValue`, `CommandReceipt`.
 
-## Built (all green, `swift test`)
+## Built (all green, `swift test` — 73 tests)
 IoTCore · IoTHomeAssistant · IoTShelly · IoTMQTT (transport injectable) · IoTWebhook · IoTHomeKit.
-Plus DynamicTariffScheduler + ExecutionContext (App-Intents remote-proxy) in IoTCore.
+Plus in IoTCore: DynamicTariffScheduler · ExecutionContext (App-Intents remote-proxy) ·
+**RawTCPWebSocketTransport** (NWConnection ws:// ATS-bypass; pure handshake/frame codec; redirect
+surfaced as `IoTError.redirected(toHTTPS:)`; loopback-tested) · **EndpointSelector** (+
+`AdaptiveLatencyProber`; hysteresis 30%+10ms+30s, SSID-lock fail-closed, backoff 2-success reset,
+fallback seed) — Lumen's raw-TCP + ConnectionManager ports are DONE.
 
 ## TODO (open)
-- **IoTCore: raw-TCP `RealtimeTransport`** (NWConnection, ATS-bypass for `ws://`/`http://` LAN) —
-  needed by Lumen; port from Lumen `FrigateMQTTClient` raw path.
-- **IoTCore: `EndpointSelector`** (adaptive-latency probe + hysteresis + **SSID-lock**) — port from
-  Lumen `ConnectionManager`; needed by Lumen (kills its app/TV fork).
 - **IoTMQTT real transport** (MQTTNIO 2.13, isolated target) — needs API verify + a broker to test.
 - **IoTShelly BLE-RPC** (CoreBluetooth GATT, device-gated).
 - **IoTNodeRED** contract flow shipping; multi-package split (distribution).
-- Adopt into apps: **Piscine** (ready), **Lumen** (after raw-TCP + EndpointSelector), **Velya**
-  (after its 1.0.2 App Store review clears), **Éclair** (dedupe primitives).
+- Adopt into apps: **Piscine** (ready), **Lumen** (ready — raw-TCP + EndpointSelector shipped;
+  app keeps persistence/stats UI + WSS pivot on `.redirected`), **Velya** (after its 1.0.2
+  App Store review clears), **Éclair** (dedupe primitives).
 
 ## House rules
 - Build/test with scratch path under /tmp: `swift test --scratch-path /tmp/lorisiot-build`.
