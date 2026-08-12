@@ -30,7 +30,7 @@ public actor RealtimeSocketClient<Message: Sendable> {
 
     private let makeTransport: @Sendable () async -> RealtimeTransport
     private let decode: @Sendable (Data) -> Message?
-    private let onConnected: @Sendable (RealtimeTransport) async -> Void   // resubscribe + backfill
+    private let onConnected: @Sendable (RealtimeTransport) async throws -> Void   // handshake/auth + resubscribe + backfill
     private let ping: @Sendable (RealtimeTransport) async -> Void          // protocol keep-alive
     private let config: Config
     private let breaker: CircuitBreaker
@@ -45,7 +45,7 @@ public actor RealtimeSocketClient<Message: Sendable> {
                 now: @escaping @Sendable () -> Date = { Date() },
                 makeTransport: @escaping @Sendable () async -> RealtimeTransport,
                 decode: @escaping @Sendable (Data) -> Message?,
-                onConnected: @escaping @Sendable (RealtimeTransport) async -> Void = { _ in },
+                onConnected: @escaping @Sendable (RealtimeTransport) async throws -> Void = { _ in },
                 ping: @escaping @Sendable (RealtimeTransport) async -> Void = { _ in }) {
         self.config = config
         self.breaker = breaker ?? CircuitBreaker(now: now)
@@ -87,7 +87,8 @@ public actor RealtimeSocketClient<Message: Sendable> {
                 try await transport.open()
                 await breaker.recordSuccess()
                 lastActivity = now()
-                await onConnected(transport)      // resubscribe + backfill on every (re)connect
+                try await onConnected(transport)  // handshake/auth + resubscribe + backfill; throws → reconnect
+                lastActivity = now()              // handshake counts as activity
                 try await pump(transport)         // returns/throws when the session dies
             } catch {
                 await breaker.recordFailure()

@@ -9,6 +9,7 @@ let package = Package(
     platforms: [.iOS(.v17), .macOS(.v14), .watchOS(.v10), .tvOS(.v17), .visionOS(.v1)],
     products: [
         .library(name: "IoTCore", targets: ["IoTCore"]),
+        .library(name: "IoTHomeAssistant", targets: ["IoTHomeAssistant"]),
     ],
     targets: [
         .target(
@@ -21,6 +22,19 @@ let package = Package(
         .testTarget(
             name: "IoTCoreTests",
             dependencies: ["IoTCore"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "IoTHomeAssistant",
+            dependencies: ["IoTCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "IoTHomeAssistantTests",
+            dependencies: ["IoTHomeAssistant"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
