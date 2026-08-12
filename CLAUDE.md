@@ -33,10 +33,10 @@ fallback seed) — Lumen's raw-TCP + ConnectionManager ports are DONE.
 - **IoTMQTT real transport** (MQTTNIO 2.13, isolated target) — needs API verify + a broker to test.
 - **IoTShelly BLE-RPC** (CoreBluetooth GATT, device-gated).
 - **IoTNodeRED** contract flow shipping; multi-package split (distribution).
-- Adopt into apps: **Piscine DONE** (2026-08-12, `904c499` — scoped commit; repo carries an
-  uncommitted release-prep wave), **Lumen** (ready — raw-TCP + EndpointSelector shipped; app keeps
-  persistence/stats UI + WSS pivot on `.redirected`), **Velya** (after its 1.0.2 App Store review
-  clears), **Éclair** (dedupe primitives).
+- Adopt into apps: **Piscine DONE** (2026-08-12, `904c499`), **Lumen DONE** (2026-08-12,
+  `56626fed` on branch `refactor/adopt-lorisiot`, not merged — FrigateMQTTClient +
+  ConnectionManager iOS/TV on IoTCore; TV fork unified), **Velya** (after its 1.0.2 App Store
+  review clears), **Éclair** (dedupe primitives).
 
 ## House rules
 - Build/test with scratch path under /tmp: `swift test --scratch-path /tmp/lorisiot-build`.
