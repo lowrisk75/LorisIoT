@@ -131,4 +131,7 @@ public enum IoTError: Error, Sendable, Equatable {
     case authenticationFailed(reason: String)
     case invalidResponse, unconfirmed, timeout, cancelled
     case notSupported(String), transport(String)
+    /// The server 30x-redirected a cleartext upgrade to an HTTPS origin (Caddy/Traefik/nginx
+    /// auto-TLS). The caller should pin the upgraded base URL and reconnect over WSS.
+    case redirected(toHTTPS: String)
 }
