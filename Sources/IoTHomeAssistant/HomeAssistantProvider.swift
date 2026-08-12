@@ -169,7 +169,8 @@ actor HASubscribeCapability: SubscribeCapability {
                 }
                 try await transport.send(HAOutbound.subscribeStateChanged(id: 1))
             },
-            ping: { transport in try? await transport.send(HAOutbound.ping(id: 999)) })
+            // HA answers pings with an inbound `pong` frame — liveness lands via receive(), not here.
+            ping: { transport in try? await transport.send(HAOutbound.ping(id: 999)); return false })
         self.socket = client
         let raw = await client.messages()
         return AsyncThrowingStream { continuation in

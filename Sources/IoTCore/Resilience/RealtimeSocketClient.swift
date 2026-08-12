@@ -39,7 +39,11 @@ public actor RealtimeSocketClient<Message: Sendable> {
     private let decode: @Sendable (Data) -> Message?
     private let onConnected: @Sendable (RealtimeTransport) async throws -> Void   // handshake/auth + resubscribe + backfill
     private let onDisconnected: @Sendable () async -> Void   // session ended / connect failed → entering backoff
-    private let ping: @Sendable (RealtimeTransport) async -> Void          // protocol keep-alive
+    /// Keep-alive per watchdog tick. Return true when the ping round-trip itself proved liveness
+    /// (e.g. URLSession pong callback) — that bumps the activity clock so a quiet-but-healthy
+    /// socket isn't killed at `staleAfter`. Transports whose pong arrives as an inbound frame
+    /// (raw TCP) return false; the frame bumps activity via `receive()`.
+    private let ping: @Sendable (RealtimeTransport) async -> Bool
     private let config: Config
     private let breaker: CircuitBreaker
     private let now: @Sendable () -> Date
@@ -60,7 +64,7 @@ public actor RealtimeSocketClient<Message: Sendable> {
                 decode: @escaping @Sendable (Data) -> Message?,
                 onConnected: @escaping @Sendable (RealtimeTransport) async throws -> Void = { _ in },
                 onDisconnected: @escaping @Sendable () async -> Void = {},
-                ping: @escaping @Sendable (RealtimeTransport) async -> Void = { await $0.ping() }) {
+                ping: @escaping @Sendable (RealtimeTransport) async -> Bool = { await $0.ping(); return false }) {
         self.config = config
         self.breaker = breaker ?? CircuitBreaker(now: now)
         self.now = now
@@ -142,7 +146,7 @@ public actor RealtimeSocketClient<Message: Sendable> {
     private func watchdog(_ transport: RealtimeTransport) async throws {
         while !Task.isCancelled {
             try await Task.sleep(for: .seconds(config.pingEvery))
-            await ping(transport)
+            if await ping(transport) { lastActivity = now() }   // pong round-trip = proof of life
             if now().timeIntervalSince(lastActivity) > config.staleAfter {
                 await transport.close()
                 throw IoTError.timeout    // silent death → force reconnect
