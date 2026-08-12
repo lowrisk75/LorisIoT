@@ -42,10 +42,10 @@ ever distributed outside the monorepo tree.
   (`LORISIOT_MQTT_BROKER=host swift test --filter CocoaMQTTLiveBrokerTests`), green vs local
   mosquitto (connect/SUBACK/QoS1 round-trip/retained).
 - BLE-RPC on-device test + BLE digest-auth (password-protected Shellys).
-- Adopt into apps: **Piscine DONE** (2026-08-12, `904c499`), **Lumen DONE** (2026-08-12,
-  `56626fed` on branch `refactor/adopt-lorisiot`, not merged — FrigateMQTTClient +
-  ConnectionManager iOS/TV on IoTCore; TV fork unified), **Velya** (after its 1.0.2 App Store
-  review clears), **Éclair** (dedupe primitives).
+- Adopt into apps: **Piscine DONE** (`904c499`) · **Lumen DONE + MERGED to main** (`56626fed`,
+  merge `587744a9`) · **Velya DONE** (2026-08-12, `e92d17c` on `refactor/adopt-lorisiot`,
+  worktree ~/GitHub/Velya-lorisiot, not merged — HA transport adopted; Shelly migrates when the
+  codex branch merges) · **Éclair** (dedupe primitives) — remaining.
 
 ## House rules
 - Build/test with scratch path under /tmp: `swift test --scratch-path /tmp/lorisiot-build`.
