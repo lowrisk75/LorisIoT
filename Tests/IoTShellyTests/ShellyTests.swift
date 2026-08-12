@@ -133,3 +133,44 @@ struct MockRPC: ShellyRPC {
         }
     }
 }
+
+// MARK: - Frame-embedded digest auth (BLE / RPC 401 → auth object)
+
+@Suite struct ShellyBLEDigestAuthTests {
+
+    static let challenge = #"{"auth_type":"digest","nonce":1638000000,"nc":1,"realm":"shellyplus1-test","algorithm":"SHA-256"}"#
+
+    @Test func rpcAuthMatchesGoldenVector() {
+        // Golden values computed independently (python hashlib) — freezing the digest scheme:
+        // ha1 = SHA256("admin:shellyplus1-test:secret"), ha2 = SHA256("dummy_method:dummy_uri"),
+        // response = SHA256("ha1:1638000000:1:12345:auth:ha2").
+        let auth = ShellyBLEFraming.rpcAuth(challengeMessage: Self.challenge, password: "secret", cnonce: 12345)
+        #expect(auth?["response"] as? String == "93f0cf19035ba26cb78296dd465de07be3ca2891868d0f3d46131cf61d901cfb")
+        #expect(auth?["username"] as? String == "admin")
+        #expect(auth?["realm"] as? String == "shellyplus1-test")
+        #expect(auth?["nonce"] as? Int == 1_638_000_000)
+        #expect(auth?["cnonce"] as? Int == 12345)
+        #expect(auth?["algorithm"] as? String == "SHA-256")
+    }
+
+    @Test func ha2IsTheFixedDummyPair() {
+        // The scheme hashes "dummy_method:dummy_uri" regardless of the actual RPC — spec quirk
+        // worth freezing (a well-meaning "fix" here would break auth on every device).
+        #expect(ShellyDigest.sha256Hex("dummy_method:dummy_uri")
+                == "6370ec69915103833b5222b368555393393f098bfbfbb59f47e0590af135f062")
+    }
+
+    @Test func unparseableChallengeReturnsNil() {
+        #expect(ShellyBLEFraming.rpcAuth(challengeMessage: "Unauthorized", password: "x") == nil)
+        #expect(ShellyBLEFraming.rpcAuth(challengeMessage: #"{"realm":"r"}"#, password: "x") == nil)   // no nonce
+    }
+
+    @Test func authedFrameCarriesTopLevelAuthObject() throws {
+        let auth = ShellyBLEFraming.rpcAuth(challengeMessage: Self.challenge, password: "secret", cnonce: 7)!
+        let frame = try ShellyBLEFraming.requestFrame(id: 2, method: "Switch.Set",
+                                                      params: ["id": 0, "on": true], auth: auth)
+        let json = try JSONSerialization.jsonObject(with: frame) as? [String: Any]
+        #expect((json?["auth"] as? [String: Any])?["username"] as? String == "admin")
+        #expect(json?["method"] as? String == "Switch.Set")
+    }
+}

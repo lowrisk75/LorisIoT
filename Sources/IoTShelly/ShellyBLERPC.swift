@@ -81,10 +81,31 @@ public enum ShellyBLEFraming {
         }
     }
 
-    /// Build the JSON-RPC request frame (same envelope as HTTP `/rpc`).
-    public static func requestFrame(id: Int, method: String, params: [String: any Sendable]) throws -> Data {
-        let body: [String: Any] = ["id": id, "method": method, "params": params]
+    /// Build the JSON-RPC request frame (same envelope as HTTP `/rpc`). `auth` carries the
+    /// frame-embedded digest object for password-protected devices (second attempt after a 401).
+    public static func requestFrame(id: Int, method: String, params: [String: any Sendable],
+                                    auth: [String: any Sendable]? = nil) throws -> Data {
+        var body: [String: Any] = ["id": id, "method": method, "params": params]
+        if let auth { body["auth"] = auth }
         return try JSONSerialization.data(withJSONObject: body)
+    }
+
+    /// Frame-embedded digest auth (Gen2 RPC over BLE or HTTP): a 401 error's `message` is a JSON
+    /// string like `{"auth_type":"digest","nonce":1638000000,"nc":1,"realm":"shellyplus1-…",
+    /// "algorithm":"SHA-256"}`. Same SHA-256 scheme as the HTTP header variant (`ShellyDigest`,
+    /// username fixed `admin`, HA2 over `dummy_method:dummy_uri`) but delivered as an `auth`
+    /// object in the retried frame. Returns nil on an unparseable challenge.
+    public static func rpcAuth(challengeMessage: String, password: String,
+                               cnonce: Int = Int.random(in: 1...Int(Int32.max))) -> [String: any Sendable]? {
+        guard let json = (try? JSONSerialization.jsonObject(with: Data(challengeMessage.utf8))) as? [String: Any],
+              let realm = json["realm"] as? String,
+              let nonce = json["nonce"] as? Int else { return nil }
+        let nc = (json["nc"] as? Int) ?? 1
+        let ha1 = ShellyDigest.sha256Hex("admin:\(realm):\(password)")
+        let ha2 = ShellyDigest.sha256Hex("dummy_method:dummy_uri")
+        let response = ShellyDigest.sha256Hex("\(ha1):\(nonce):\(nc):\(cnonce):auth:\(ha2)")
+        return ["realm": realm, "username": "admin", "nonce": nonce, "cnonce": cnonce,
+                "response": response, "algorithm": "SHA-256"]
     }
 
     /// Parse a JSON-RPC response frame → result dict; RPC errors become typed `IoTError`s.
@@ -124,7 +145,19 @@ public actor ShellyBLERPC: ShellyRPC {
         let request = try ShellyBLEFraming.requestFrame(id: 1, method: method, params: params)
         let session = ShellyBLESession(deviceName: host, scanTimeout: scanTimeout, rpcTimeout: rpcTimeout)
         let response = try await session.exchange(request)
-        return try ShellyBLEFraming.parseResponse(response)
+        do {
+            return try ShellyBLEFraming.parseResponse(response)
+        } catch let IoTError.authenticationFailed(reason: challenge) {
+            // Password-protected device: the 401's message IS the digest challenge — retry once
+            // with the frame-embedded auth object (mirrors the HTTP 401 → digest-header retry).
+            guard let password,
+                  let auth = ShellyBLEFraming.rpcAuth(challengeMessage: challenge, password: password) else {
+                throw IoTError.authenticationFailed(reason: challenge)
+            }
+            let authed = try ShellyBLEFraming.requestFrame(id: 2, method: method, params: params, auth: auth)
+            let retry = ShellyBLESession(deviceName: host, scanTimeout: scanTimeout, rpcTimeout: rpcTimeout)
+            return try await ShellyBLEFraming.parseResponse(retry.exchange(authed))
+        }
     }
 }
 
