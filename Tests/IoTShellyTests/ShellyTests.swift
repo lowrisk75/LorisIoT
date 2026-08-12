@@ -81,3 +81,55 @@ struct MockRPC: ShellyRPC {
         #expect(caps.readState != nil)
     }
 }
+
+// MARK: - BLE-RPC framing (pure — the GATT shell is device-gated)
+
+@Suite struct ShellyBLEFramingTests {
+
+    @Test func lengthPrefixIsBigEndian32() {
+        #expect(ShellyBLEFraming.lengthPrefix(for: Data(count: 0x0102)) == Data([0, 0, 0x01, 0x02]))
+        #expect(ShellyBLEFraming.lengthPrefix(for: Data()) == Data([0, 0, 0, 0]))
+    }
+
+    @Test func expectedLengthRoundTripsAndCaps() throws {
+        let payload = Data(repeating: 7, count: 300)
+        let prefix = ShellyBLEFraming.lengthPrefix(for: payload)
+        #expect(try ShellyBLEFraming.expectedLength(from: prefix) == 300)
+        // 2 MB declared > 1 MB cap → typed transport error, not a silent huge alloc.
+        let huge = Data([0x00, 0x20, 0x00, 0x00])
+        #expect(throws: IoTError.self) { try ShellyBLEFraming.expectedLength(from: huge) }
+        #expect(throws: IoTError.invalidResponse) { try ShellyBLEFraming.expectedLength(from: Data([1, 2])) }
+    }
+
+    @Test func chunkingCoversPayloadExactly() {
+        let payload = Data((0..<53).map { UInt8($0) })
+        let chunks = ShellyBLEFraming.chunks(payload, mtu: 20)
+        #expect(chunks.count == 3)
+        #expect(chunks.map(\.count) == [20, 20, 13])
+        #expect(chunks.reduce(Data(), +) == payload)
+    }
+
+    @Test func reassemblerCompletesAcrossChunkBoundaries() {
+        let frame = Data(#"{"id":1,"result":{"output":true}}"#.utf8)
+        var reassembler = ShellyBLEFraming.Reassembler(expected: frame.count)
+        var result: Data?
+        for chunk in ShellyBLEFraming.chunks(frame, mtu: 5) {
+            result = reassembler.append(chunk)
+        }
+        #expect(result == frame)
+    }
+
+    @Test func requestAndResponseUseTheHTTPRPCEnvelope() throws {
+        let frame = try ShellyBLEFraming.requestFrame(id: 1, method: "Switch.Set", params: ["id": 0, "on": true])
+        let json = try JSONSerialization.jsonObject(with: frame) as? [String: Any]
+        #expect(json?["method"] as? String == "Switch.Set")
+
+        let ok = Data(#"{"id":1,"result":{"was_on":false}}"#.utf8)
+        #expect(try ShellyBLEFraming.parseResponse(ok)["was_on"] as? Bool == false)
+
+        let denied = Data(#"{"id":1,"error":{"code":401,"message":"Unauthorized"}}"#.utf8)
+        #expect(throws: IoTError.authenticationFailed(reason: "Unauthorized")) {
+            _ = try ShellyBLEFraming.parseResponse(denied)
+        }
+    }
+}
