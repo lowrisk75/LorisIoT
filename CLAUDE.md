@@ -21,18 +21,26 @@ Shared internal IoT framework for LorisLabs apps (Velya · Éclair · Lumen · P
 Model = capability-discovery (`DeviceProvider.capabilities(for:)` → `DeviceCapabilitySet` with typed
 Control/ReadState/Schedule/Subscribe capability actors), typed IDs, closed `StateValue`, `CommandReceipt`.
 
-## Built (all green, `swift test` — 73 tests)
-IoTCore · IoTHomeAssistant · IoTShelly · IoTMQTT (transport injectable) · IoTWebhook · IoTHomeKit.
-Plus in IoTCore: DynamicTariffScheduler · ExecutionContext (App-Intents remote-proxy) ·
-**RawTCPWebSocketTransport** (NWConnection ws:// ATS-bypass; pure handshake/frame codec; redirect
-surfaced as `IoTError.redirected(toHTTPS:)`; loopback-tested) · **EndpointSelector** (+
-`AdaptiveLatencyProber`; hysteresis 30%+10ms+30s, SSID-lock fail-closed, backoff 2-success reset,
-fallback seed) — Lumen's raw-TCP + ConnectionManager ports are DONE.
+## Built (all green, `swift test` — 91 tests)
+IoTCore · IoTHomeAssistant · IoTShelly (incl. **BLE-RPC** GATT fallback, framing pure-tested,
+CoreBluetooth shell device-gated, no BLE digest-auth in v1) · IoTMQTT (transport injectable) ·
+**IoTMQTTCocoa** (CocoaMQTT 2.4 wrapped per research #18 — isolated target, lib types never cross
+the boundary; broker-less delegate-bridge tests; NOT validated against a live broker yet) ·
+IoTWebhook (+ shipped contract: `Docs/WEBHOOK-CONTRACT.md` + `Docs/nodered/flows.json` reference
+flow, contract-freeze tests) · IoTHomeKit.
+Plus in IoTCore: DynamicTariffScheduler · ExecutionContext · **RawTCPWebSocketTransport**
+(NWConnection ws:// ATS-bypass; redirect → `IoTError.redirected(toHTTPS:)`; loopback-tested) ·
+**EndpointSelector** (+ `AdaptiveLatencyProber`; hysteresis 30%+10ms+30s, SSID-lock fail-closed).
 
-## TODO (open)
-- **IoTMQTT real transport** (MQTTNIO 2.13, isolated target) — needs API verify + a broker to test.
-- **IoTShelly BLE-RPC** (CoreBluetooth GATT, device-gated).
-- **IoTNodeRED** contract flow shipping; multi-package split (distribution).
+**Multi-package split: WON'T DO** (2026-08-12) — single package with per-product isolated targets
+already gives dependency isolation (apps not linking IoTMQTTCocoa never pull CocoaMQTT), and a
+split would break the `path:`-based references in Piscine/Lumen. Revisit only if the framework is
+ever distributed outside the monorepo tree.
+
+## TODO (open, device/broker-gated)
+- Validate IoTMQTTCocoa against a live broker (mosquitto on the homelab) — wiring is tested, the
+  CocoaMQTT session itself is not.
+- BLE-RPC on-device test + BLE digest-auth (password-protected Shellys).
 - Adopt into apps: **Piscine DONE** (2026-08-12, `904c499`), **Lumen DONE** (2026-08-12,
   `56626fed` on branch `refactor/adopt-lorisiot`, not merged — FrigateMQTTClient +
   ConnectionManager iOS/TV on IoTCore; TV fork unified), **Velya** (after its 1.0.2 App Store
