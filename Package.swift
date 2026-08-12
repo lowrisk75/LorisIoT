@@ -12,6 +12,7 @@ let package = Package(
         .library(name: "IoTHomeAssistant", targets: ["IoTHomeAssistant"]),
         .library(name: "IoTShelly", targets: ["IoTShelly"]),
         .library(name: "IoTMQTT", targets: ["IoTMQTT"]),
+        .library(name: "IoTWebhook", targets: ["IoTWebhook"]),
     ],
     targets: [
         .target(
@@ -64,6 +65,19 @@ let package = Package(
         .testTarget(
             name: "IoTMQTTTests",
             dependencies: ["IoTMQTT"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "IoTWebhook",
+            dependencies: ["IoTCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "IoTWebhookTests",
+            dependencies: ["IoTWebhook"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
