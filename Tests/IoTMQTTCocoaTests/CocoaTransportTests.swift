@@ -125,3 +125,57 @@ private let dummy = {
         #expect(last == true)
     }
 }
+
+// MARK: - Live broker (opt-in: LORISIOT_MQTT_BROKER=host — CI/unit runs never need a broker)
+
+@Suite struct CocoaMQTTLiveBrokerTests {
+
+    static var brokerHost: String? { ProcessInfo.processInfo.environment["LORISIOT_MQTT_BROKER"] }
+
+    @Test(.enabled(if: brokerHost != nil))
+    func liveConnectSubscribePublishReceive() async throws {
+        let config = MQTTBrokerConfig(host: Self.brokerHost!, clientID: "lorisiot-test-\(UUID().uuidString.prefix(8))")
+        let transport = CocoaMQTTTransport(config: config)
+        try await transport.connect()
+        let stream = await transport.messages()
+        let topic = "lorisiot/test/\(UUID().uuidString.prefix(8))"
+        try await transport.subscribe(topic: topic)
+        try await transport.publish(topic: topic, payload: Data("ON".utf8), qos: .atLeastOnce, retain: false)
+
+        let first: (topic: String, payload: Data)? = await withTaskGroup(of: (topic: String, payload: Data)?.self) { group in
+            group.addTask { for await frame in stream { return frame }; return nil }
+            group.addTask { try? await Task.sleep(for: .seconds(10)); return nil }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
+        }
+        await transport.disconnect()
+        #expect(first?.topic == topic)
+        #expect(first.map { String(data: $0.payload, encoding: .utf8) } == "ON")
+    }
+
+    @Test(.enabled(if: brokerHost != nil))
+    func liveRetainedMessageGivesLastKnownState() async throws {
+        let topic = "lorisiot/test/retained-\(UUID().uuidString.prefix(8))"
+        // Writer publishes retained, then a LATER subscriber must still receive it.
+        let writer = CocoaMQTTTransport(config: .init(host: Self.brokerHost!, clientID: "lorisiot-w-\(UUID().uuidString.prefix(8))"))
+        try await writer.connect()
+        try await writer.publish(topic: topic, payload: Data("OFF".utf8), qos: .atLeastOnce, retain: true)
+        try await Task.sleep(for: .milliseconds(300))
+        await writer.disconnect()
+
+        let reader = CocoaMQTTTransport(config: .init(host: Self.brokerHost!, clientID: "lorisiot-r-\(UUID().uuidString.prefix(8))"))
+        try await reader.connect()
+        let stream = await reader.messages()
+        try await reader.subscribe(topic: topic)
+        let first: (topic: String, payload: Data)? = await withTaskGroup(of: (topic: String, payload: Data)?.self) { group in
+            group.addTask { for await frame in stream { return frame }; return nil }
+            group.addTask { try? await Task.sleep(for: .seconds(10)); return nil }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
+        }
+        await reader.disconnect()
+        #expect(first.map { String(data: $0.payload, encoding: .utf8) } == "OFF")
+    }
+}
