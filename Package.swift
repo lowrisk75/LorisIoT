@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "IoTCore", targets: ["IoTCore"]),
         .library(name: "IoTHomeAssistant", targets: ["IoTHomeAssistant"]),
         .library(name: "IoTShelly", targets: ["IoTShelly"]),
+        .library(name: "IoTMQTT", targets: ["IoTMQTT"]),
     ],
     targets: [
         .target(
@@ -49,6 +50,20 @@ let package = Package(
         .testTarget(
             name: "IoTShellyTests",
             dependencies: ["IoTShelly"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // NOTE: MQTTNIO-backed transport is added behind this module later (isolated dep, per spec).
+        .target(
+            name: "IoTMQTT",
+            dependencies: ["IoTCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "IoTMQTTTests",
+            dependencies: ["IoTMQTT"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
