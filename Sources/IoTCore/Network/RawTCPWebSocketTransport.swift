@@ -207,12 +207,12 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
         connection = conn
         decoder = WebSocketFrameDecoder()
 
-        try await Self.waitReady(conn, timeout: connectTimeout)
+        try await NWConnectionAsync.waitReady(conn, timeout: connectTimeout)
 
         let request = WebSocketHandshake.upgradeRequest(
             host: host, path: url.path, key: WebSocketHandshake.randomKey(),
             extraHeaders: extraHeaders)
-        try await Self.sendRaw(conn, request)
+        try await NWConnectionAsync.send(conn, request)
 
         let response = try await readUntilHeaderEnd(conn)
         switch WebSocketHandshake.parseUpgradeResponse(response) {
@@ -230,14 +230,14 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
     public func send(_ data: Data) async throws {
         guard let connection else { throw IoTError.notConnected }
         let frame = WebSocketFrameCodec.encodeFrame(sendsText ? .text : .binary, payload: data)
-        try await Self.sendRaw(connection, frame)
+        try await NWConnectionAsync.send(connection, frame)
     }
 
     /// Keep-alive for the `RealtimeSocketClient` ping hook. Errors are swallowed — a dead socket
     /// is detected by the watchdog's staleness check, not by ping delivery.
     public func sendPing() async {
         guard let connection else { return }
-        try? await Self.sendRaw(connection, WebSocketFrameCodec.encodeFrame(.ping))
+        try? await NWConnectionAsync.send(connection, WebSocketFrameCodec.encodeFrame(.ping))
     }
 
     public func receive() async throws -> Data {
@@ -248,7 +248,7 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
                 case .text, .binary, .continuation:
                     return frame.payload
                 case .ping:
-                    try? await Self.sendRaw(connection, WebSocketFrameCodec.encodeFrame(.pong, payload: frame.payload))
+                    try? await NWConnectionAsync.send(connection, WebSocketFrameCodec.encodeFrame(.pong, payload: frame.payload))
                     return Data()          // liveness signal upstream; decodes to nil
                 case .pong:
                     return Data()          // liveness signal upstream; decodes to nil
@@ -257,7 +257,7 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
                     throw IoTError.transport("server closed WebSocket")
                 }
             }
-            decoder.append(try await Self.receiveChunk(connection))
+            decoder.append(try await NWConnectionAsync.receiveChunk(connection))
         }
     }
 
@@ -270,73 +270,7 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
                   completion: .contentProcessed { _ in conn.cancel() })
     }
 
-    // MARK: - NWConnection plumbing
-
-    /// Resume-once continuation guard. `nonisolated(unsafe)` state is lock-protected.
-    private final class ResumeOnce<T: Sendable>: @unchecked Sendable {
-        private let lock = NSLock()
-        private var done = false
-        func resume(_ cont: CheckedContinuation<T, any Error>, with result: Result<T, any Error>) {
-            lock.lock()
-            let first = !done
-            done = true
-            lock.unlock()
-            guard first else { return }
-            cont.resume(with: result)
-        }
-        var isDone: Bool { lock.lock(); defer { lock.unlock() }; return done }
-    }
-
-    /// Wait for `.ready` with a hard timeout. Ported fix (Lumen 2026-05-31): the timeout is
-    /// DISARMED once the connection resolves — a live session must never be killed at T+timeout.
-    /// `.waiting` fails fast instead of hanging on an unroutable LAN address.
-    private static func waitReady(_ connection: NWConnection, timeout: Double) async throws {
-        let once = ResumeOnce<Void>()
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
-            connection.stateUpdateHandler = { state in
-                switch state {
-                case .ready: once.resume(cont, with: .success(()))
-                case .failed(let error): once.resume(cont, with: .failure(error))
-                case .cancelled: once.resume(cont, with: .failure(IoTError.cancelled))
-                case .waiting(let error):
-                    connection.cancel()
-                    once.resume(cont, with: .failure(error))
-                default: break
-                }
-            }
-            connection.start(queue: .global(qos: .userInitiated))
-            Task {
-                try? await Task.sleep(for: .seconds(timeout))
-                guard !once.isDone else { return }
-                connection.cancel()    // forces .cancelled → resumes via the state handler
-                once.resume(cont, with: .failure(IoTError.timeout))
-            }
-        }
-    }
-
-    private static func sendRaw(_ connection: NWConnection, _ data: Data) async throws {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, any Error>) in
-            connection.send(content: data, completion: .contentProcessed { error in
-                if let error { cont.resume(throwing: error) } else { cont.resume() }
-            })
-        }
-    }
-
-    private static func receiveChunk(_ connection: NWConnection) async throws -> Data {
-        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Data, any Error>) in
-            connection.receive(minimumIncompleteLength: 1, maximumLength: 65536) { content, _, isComplete, error in
-                if let error {
-                    cont.resume(throwing: error)
-                } else if let content, !content.isEmpty {
-                    cont.resume(returning: content)
-                } else if isComplete {
-                    cont.resume(throwing: IoTError.transport("TCP stream ended"))
-                } else {
-                    cont.resume(throwing: IoTError.invalidResponse)
-                }
-            }
-        }
-    }
+    // MARK: - NWConnection plumbing (shared helpers in NWConnectionAsync)
 
     /// Read raw bytes until the `\r\n\r\n` end of the HTTP upgrade response (8 KB cap). Any body
     /// bytes beyond the separator are fed to the frame decoder — servers may pipeline the first
@@ -345,7 +279,7 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
         var buffer = Data()
         let separator = Data("\r\n\r\n".utf8)
         while true {
-            buffer.append(try await Self.receiveChunk(connection))
+            buffer.append(try await NWConnectionAsync.receiveChunk(connection))
             if let range = buffer.range(of: separator) {
                 let remainder = buffer[range.upperBound...]
                 if !remainder.isEmpty { decoder.append(Data(remainder)) }
