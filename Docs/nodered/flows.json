@@ -1,0 +1,90 @@
+[
+    {
+        "id": "lorisiot-webhook-in",
+        "type": "http in",
+        "z": "lorisiot-flow",
+        "name": "LorisIoT webhook (v1)",
+        "url": "/lorisiot/webhook",
+        "method": "post",
+        "upload": false,
+        "swaggerDoc": "",
+        "x": 150,
+        "y": 120,
+        "wires": [["lorisiot-verify"]]
+    },
+    {
+        "id": "lorisiot-verify",
+        "type": "function",
+        "z": "lorisiot-flow",
+        "name": "verify HMAC + ts + dedupe (contract v1)",
+        "func": "// Secret: set once in this node's 'secret' env/context — never in the URL.\nconst crypto = global.get('crypto') || require('crypto');\nconst SECRET = env.get('LORISIOT_WEBHOOK_SECRET') || flow.get('lorisiot_secret');\nconst REPLAY_WINDOW_S = 300;\nconst DEDUPE_CAP = 1000;\n\nif (!SECRET) { msg.statusCode = 500; msg.payload = { error: 'secret not configured' }; return [null, msg]; }\n\n// 1. Signature — recompute over the RAW body and constant-time compare.\nconst raw = msg.req.rawBody !== undefined ? msg.req.rawBody : JSON.stringify(msg.payload);\nconst expected = 'sha256=' + crypto.createHmac('sha256', SECRET).update(raw).digest('hex');\nconst given = msg.req.headers['x-lorisiot-signature'] || '';\nconst ok = given.length === expected.length && crypto.timingSafeEqual(Buffer.from(given), Buffer.from(expected));\nif (!ok) { msg.statusCode = 401; msg.payload = { error: 'bad signature' }; return [null, msg]; }\n\nconst body = msg.payload;\n\n// 2. Replay window on ts.\nconst now = Math.floor(Date.now() / 1000);\nif (typeof body.ts !== 'number' || Math.abs(now - body.ts) > REPLAY_WINDOW_S) {\n    msg.statusCode = 403; msg.payload = { error: 'stale timestamp' }; return [null, msg];\n}\n\n// 3. eventId dedupe — a retried POST must not double-fire.\nconst seen = context.get('seenEventIds') || [];\nif (seen.includes(body.eventId)) {\n    msg.statusCode = 200; msg.payload = { duplicate: true }; return [null, msg];\n}\nseen.push(body.eventId);\nif (seen.length > DEDUPE_CAP) seen.splice(0, seen.length - DEDUPE_CAP);\ncontext.set('seenEventIds', seen);\n\n// 4. Version gate — branch on v, never guess an unknown contract.\nif (body.v !== 1) { msg.statusCode = 400; msg.payload = { error: 'unsupported contract version ' + body.v }; return [null, msg]; }\n\nmsg.statusCode = 200;\nreturn [msg, null];\n",
+        "outputs": 2,
+        "noerr": 0,
+        "x": 420,
+        "y": 120,
+        "wires": [["lorisiot-route"], ["lorisiot-reply"]]
+    },
+    {
+        "id": "lorisiot-route",
+        "type": "switch",
+        "z": "lorisiot-flow",
+        "name": "route on action",
+        "property": "payload.action",
+        "propertyType": "msg",
+        "rules": [
+            { "t": "eq", "v": "wake", "vt": "str" },
+            { "t": "else" }
+        ],
+        "checkall": "false",
+        "outputs": 2,
+        "x": 660,
+        "y": 100,
+        "wires": [["lorisiot-action-wake", "lorisiot-reply-ok"], ["lorisiot-action-other", "lorisiot-reply-ok"]]
+    },
+    {
+        "id": "lorisiot-action-wake",
+        "type": "debug",
+        "z": "lorisiot-flow",
+        "name": "action: wake — replace with your automation",
+        "active": true,
+        "tosidebar": true,
+        "complete": "payload",
+        "x": 920,
+        "y": 80,
+        "wires": []
+    },
+    {
+        "id": "lorisiot-action-other",
+        "type": "debug",
+        "z": "lorisiot-flow",
+        "name": "unhandled action — inspect payload",
+        "active": true,
+        "tosidebar": true,
+        "complete": "payload",
+        "x": 900,
+        "y": 140,
+        "wires": []
+    },
+    {
+        "id": "lorisiot-reply",
+        "type": "http response",
+        "z": "lorisiot-flow",
+        "name": "reply",
+        "statusCode": "",
+        "headers": {},
+        "x": 650,
+        "y": 180,
+        "wires": []
+    },
+    {
+        "id": "lorisiot-reply-ok",
+        "type": "http response",
+        "z": "lorisiot-flow",
+        "name": "200",
+        "statusCode": "200",
+        "headers": {},
+        "x": 890,
+        "y": 200,
+        "wires": []
+    }
+]

@@ -48,3 +48,27 @@ actor RecordingHTTP: WebhookHTTP {
         }
     }
 }
+
+// MARK: - Contract freeze (Docs/WEBHOOK-CONTRACT.md + Docs/nodered/flows.json)
+
+@Suite struct WebhookContractFreezeTests {
+
+    /// Golden HMAC — the reference Node-RED flow recomputes exactly this. If this test breaks,
+    /// the wire contract changed and every deployed flow breaks with it: bump `v` instead.
+    @Test func signatureMatchesTheReferenceFlow() {
+        #expect(WebhookClient.signature(body: Data("hello".utf8), secret: "s3cret")
+                == "e5a01537481fa0b2c697f787c7aff885412cf0760d08e08502259b39d2d6ae68")
+    }
+
+    @Test func payloadWireFormatIsStable() throws {
+        let payload = WebhookPayload(eventId: "E1", ts: 1_723_400_000, action: "wake",
+                                     device: "coffee", params: ["on": "true"])
+        let json = try JSONSerialization.jsonObject(with: JSONEncoder().encode(payload)) as? [String: Any]
+        #expect(json?["v"] as? Int == 1)
+        #expect(json?["eventId"] as? String == "E1")
+        #expect(json?["ts"] as? Int == 1_723_400_000)
+        #expect(json?["action"] as? String == "wake")
+        #expect(json?["device"] as? String == "coffee")
+        #expect((json?["params"] as? [String: String])?["on"] == "true")
+    }
+}
