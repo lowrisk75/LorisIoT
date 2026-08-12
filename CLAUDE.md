@@ -37,9 +37,10 @@ already gives dependency isolation (apps not linking IoTMQTTCocoa never pull Coc
 split would break the `path:`-based references in Piscine/Lumen. Revisit only if the framework is
 ever distributed outside the monorepo tree.
 
-## TODO (open, device/broker-gated)
-- Validate IoTMQTTCocoa against a live broker (mosquitto on the homelab) — wiring is tested, the
-  CocoaMQTT session itself is not.
+## TODO (open, device-gated)
+- ~~Validate IoTMQTTCocoa vs live broker~~ DONE 2026-08-12 — opt-in suite
+  (`LORISIOT_MQTT_BROKER=host swift test --filter CocoaMQTTLiveBrokerTests`), green vs local
+  mosquitto (connect/SUBACK/QoS1 round-trip/retained).
 - BLE-RPC on-device test + BLE digest-auth (password-protected Shellys).
 - Adopt into apps: **Piscine DONE** (2026-08-12, `904c499`), **Lumen DONE** (2026-08-12,
   `56626fed` on branch `refactor/adopt-lorisiot`, not merged — FrigateMQTTClient +
