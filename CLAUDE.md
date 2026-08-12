@@ -41,7 +41,8 @@ ever distributed outside the monorepo tree.
 - ~~Validate IoTMQTTCocoa vs live broker~~ DONE 2026-08-12 — opt-in suite
   (`LORISIOT_MQTT_BROKER=host swift test --filter CocoaMQTTLiveBrokerTests`), green vs local
   mosquitto (connect/SUBACK/QoS1 round-trip/retained).
-- BLE-RPC on-device test + BLE digest-auth (password-protected Shellys).
+- ~~BLE digest-auth~~ DONE 2026-08-12 (frame-embedded auth object, golden-vector tests).
+  Reste : test BLE-RPC on-device (Shelly Gen2+ avec "Bluetooth RPC" activé, à portée du Mac).
 - Adopt into apps — **ALL 4 DONE** (2026-08-12): Piscine `904c499` · Lumen `56626fed` (merged
   main) · Velya `e92d17c` (merged its main; Shelly migrates when the codex branch lands) ·
   Éclair `8eba3b32` (on `refactor/adopt-lorisiot` off the redesign trunk, not merged — WS client
