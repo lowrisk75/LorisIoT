@@ -88,3 +88,65 @@ private func json(_ s: String) -> Data { Data(s.utf8) }
         }
     }
 }
+
+// MARK: - HARestClient additions (setState / rich callService / raw passthroughs)
+
+@Suite struct HARestClientAdditionsTests {
+
+    @Test func setStatePostsStateAndAttributes() async throws {
+        let captured = CapturedRequest()
+        let client = HARestClient(http: MockHTTP { method, path, body in
+            Task { await captured.set(method: method, path: path, body: body) }
+            return (Data("{}".utf8), 200)
+        })
+        try await client.setState(entityID: "sensor.velya_next_wake", state: "2026-08-12T07:00:00Z",
+                                  attributes: ["device_class": "timestamp", "velya_actions": "[]"])
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await captured.method == "POST")
+        #expect(await captured.path == "api/states/sensor.velya_next_wake")
+        let json = try JSONSerialization.jsonObject(with: await captured.body ?? Data()) as? [String: Any]
+        #expect(json?["state"] as? String == "2026-08-12T07:00:00Z")
+        #expect((json?["attributes"] as? [String: Any])?["device_class"] as? String == "timestamp")
+    }
+
+    @Test func setStateAuthErrorIsTyped() async {
+        let client = HARestClient(http: MockHTTP { _, _, _ in (Data(), 401) })
+        await #expect(throws: IoTError.authenticationFailed(reason: "HTTP 401")) {
+            try await client.setState(entityID: "sensor.x", state: "unavailable")
+        }
+    }
+
+    @Test func callServiceCarriesHeterogeneousData() async throws {
+        let captured = CapturedRequest()
+        let client = HARestClient(http: MockHTTP { method, path, body in
+            Task { await captured.set(method: method, path: path, body: body) }
+            return (Data("[]".utf8), 200)
+        })
+        try await client.callService(domain: "light", service: "turn_on", entityID: "light.bed",
+                                     data: ["brightness_pct": 60, "transition": 2.5, "effect": "sunrise"])
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(await captured.path == "api/services/light/turn_on")
+        let json = try JSONSerialization.jsonObject(with: await captured.body ?? Data()) as? [String: Any]
+        #expect(json?["entity_id"] as? String == "light.bed")
+        #expect(json?["transition"] as? Double == 2.5)
+        #expect(json?["effect"] as? String == "sunrise")
+    }
+
+    @Test func rawPassthroughsReturnBodyAfterStatusCheck() async throws {
+        let payload = #"[{"entity_id":"sensor.t","state":"21.5","attributes":{"unit":"°C"}}]"#
+        let client = HARestClient(http: MockHTTP { _, path, _ in
+            (Data(payload.utf8), path == "api/states" ? 200 : 404)
+        })
+        #expect(try await client.statesData() == Data(payload.utf8))
+        await #expect(throws: IoTError.invalidResponse) { _ = try await client.stateData(entityID: "sensor.gone") }
+    }
+}
+
+private actor CapturedRequest {
+    private(set) var method: String?
+    private(set) var path: String?
+    private(set) var body: Data?
+    func set(method: String, path: String, body: Data?) {
+        self.method = method; self.path = path; self.body = body
+    }
+}
