@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "IoTShelly", targets: ["IoTShelly"]),
         .library(name: "IoTMQTT", targets: ["IoTMQTT"]),
         .library(name: "IoTWebhook", targets: ["IoTWebhook"]),
+        .library(name: "IoTHomeKit", targets: ["IoTHomeKit"]),
     ],
     targets: [
         .target(
@@ -78,6 +79,20 @@ let package = Package(
         .testTarget(
             name: "IoTWebhookTests",
             dependencies: ["IoTWebhook"],
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        // HomeKit is device-gated (HMTimerTrigger fires on the home hub; not testable in the sim/host).
+        .target(
+            name: "IoTHomeKit",
+            dependencies: ["IoTCore"],
+            swiftSettings: [
+                .swiftLanguageMode(.v6),
+                .enableUpcomingFeature("StrictConcurrency"),
+            ]
+        ),
+        .testTarget(
+            name: "IoTHomeKitTests",
+            dependencies: ["IoTHomeKit"],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
