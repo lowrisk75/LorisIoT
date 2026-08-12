@@ -21,7 +21,7 @@ public actor HARestClient {
         let (data, status) = try await http.send(method: "GET", path: "api/states/\(entityID)", body: nil)
         try Self.check(status)
         do { return try JSONDecoder().decode(HAEntityState.self, from: data) }
-        catch { throw ProviderError.invalidResponse }
+        catch { throw IoTError.invalidResponse }
     }
 
     /// All entity states (initial snapshot; then keep live via the WebSocket).
@@ -29,7 +29,7 @@ public actor HARestClient {
         let (data, status) = try await http.send(method: "GET", path: "api/states", body: nil)
         try Self.check(status)
         do { return try JSONDecoder().decode([HAEntityState].self, from: data) }
-        catch { throw ProviderError.invalidResponse }
+        catch { throw IoTError.invalidResponse }
     }
 
     /// Call a service, e.g. `light.turn_on` on `light.kitchen` with `{brightness_pct: 60}`.
@@ -54,9 +54,9 @@ public actor HARestClient {
     private static func check(_ status: Int) throws {
         switch status {
         case 200...299: return
-        case 401, 403: throw ProviderError.authenticationFailed(reason: "HTTP \(status)")
-        case 404: throw ProviderError.invalidResponse
-        default: throw ProviderError.transport("HTTP \(status)")
+        case 401, 403: throw IoTError.authenticationFailed(reason: "HTTP \(status)")
+        case 404: throw IoTError.invalidResponse
+        default: throw IoTError.transport("HTTP \(status)")
         }
     }
 }

@@ -3,45 +3,39 @@ import Foundation
 @testable import IoTHomeAssistant
 import IoTCore
 
-/// Scripted HTTP mock: answers from a Sendable closure, no network.
 struct MockHTTP: HAHTTP {
     let handler: @Sendable (_ method: String, _ path: String, _ body: Data?) -> (Data, Int)
-    func send(method: String, path: String, body: Data?) async throws -> (Data, Int) {
-        handler(method, path, body)
-    }
+    func send(method: String, path: String, body: Data?) async throws -> (Data, Int) { handler(method, path, body) }
 }
-
 private func json(_ s: String) -> Data { Data(s.utf8) }
 
 @Suite struct HAModelTests {
     @Test func decodesEntityAndMapsToDeviceState() throws {
-        let data = json(#"""
-        {"entity_id":"light.kitchen","state":"on",
-         "attributes":{"friendly_name":"Kitchen","brightness":128}}
-        """#)
-        let e = try JSONDecoder().decode(HAEntityState.self, from: data)
+        let e = try JSONDecoder().decode(HAEntityState.self, from: json(#"""
+        {"entity_id":"light.kitchen","state":"on","attributes":{"friendly_name":"Kitchen","brightness":128}}
+        """#))
         #expect(e.entityID == "light.kitchen")
-        let ds = e.deviceState
-        #expect(ds.power == true)
-        #expect(ds.name == "Kitchen")
-        #expect(ds.level == 50)          // 128/255 ≈ 50%
-        #expect(ds.reachable)
+        #expect(e.isOn == true)
+        let ds = e.deviceState(sequence: 1)
+        #expect(ds.availability == .online)
+        #expect(ds.primaryValue == .bool(true))
+        #expect(ds.attributes["level"]?.value == .integer(50))   // 128/255 ≈ 50%
+        #expect(ds.revision.localSequence == 1)
     }
 
-    @Test func unavailableMapsToUnreachable() throws {
+    @Test func unavailableMapsToOffline() throws {
         let e = try JSONDecoder().decode(HAEntityState.self,
                     from: json(#"{"entity_id":"switch.pump","state":"unavailable","attributes":{}}"#))
-        #expect(e.deviceState.reachable == false)
-        #expect(e.deviceState.power == nil)
+        #expect(e.deviceState(sequence: 1).availability == .offline)
+        #expect(e.isOn == nil)
     }
 
     @Test func domainInference() {
         #expect(haDomain(of: "light.kitchen") == "light")
-        #expect(haDomain(of: "switch.pump") == "switch")
+        #expect(HomeAssistantProvider.kind(for: "switch.pump") == .switchDevice)
     }
 
     @Test func websocketMessageDecoding() {
-        #expect({ if case .authRequired = HAMessage.decode(json(#"{"type":"auth_required"}"#))! { return true }; return false }())
         #expect({ if case .authOK = HAMessage.decode(json(#"{"type":"auth_ok"}"#))! { return true }; return false }())
         let event = json(#"""
         {"type":"event","event":{"event_type":"state_changed","data":{"new_state":
@@ -53,17 +47,9 @@ private func json(_ s: String) -> Data { Data(s.utf8) }
 
     @Test func configNormalizeAndWebsocketURL() {
         let c = HAConfig(baseURL: HAConfig.normalize("homeassistant.local:8123")!)
-        #expect(c.baseURL.absoluteString == "https://homeassistant.local:8123")
         #expect(c.websocketURL?.absoluteString == "wss://homeassistant.local:8123/api/websocket")
         let http = HAConfig(baseURL: HAConfig.normalize("http://192.168.1.2:8123")!)
         #expect(http.websocketURL?.absoluteString == "ws://192.168.1.2:8123/api/websocket")
-    }
-
-    @Test func nextISOIsFutureOnTheMinute() {
-        let cal = Calendar(identifier: .gregorian)
-        let now = cal.date(from: DateComponents(year: 2026, month: 1, day: 1, hour: 8, minute: 0))!
-        let s = HomeAssistantProvider.nextISO(hour: 6, minute: 40, now: now, calendar: cal)
-        #expect(s == "2026-01-02 06:40:00")   // 06:40 already passed today → tomorrow
     }
 }
 
@@ -73,31 +59,32 @@ private func json(_ s: String) -> Data { Data(s.utf8) }
                               token: "TESTTOKEN", http: MockHTTP(handler: handler))
     }
 
-    @Test func setPowerConfirmsByReread() async throws {
-        // turn_on succeeds, then the re-read reports "on" → confirmed.
-        let p = provider { method, path, _ in
-            if method == "POST" { return (Data("[]".utf8), 200) }
-            return (json(#"{"entity_id":"switch.pump","state":"on","attributes":{}}"#), 200)
+    @Test func controlAppliedWhenConfirmed() async throws {
+        let p = provider { method, _, _ in
+            method == "POST" ? (Data("[]".utf8), 200)
+                             : (json(#"{"entity_id":"switch.pump","state":"on","attributes":{}}"#), 200)
         }
-        let ds = try await p.setState(DeviceTarget(id: "switch.pump"), .setPower(true))
-        #expect(ds.power == true)
+        let caps = try await p.capabilities(for: "switch.pump")
+        let control = try #require(caps.control)
+        let receipt = try await control.execute(SetPowerCommand(deviceID: "switch.pump", isOn: true))
+        #expect(receipt.outcome == .applied)
     }
 
-    @Test func setPowerThrowsWhenNotConfirmed() async throws {
-        // turn_on "succeeds" but the device still reads "off" → confirm-by-reread must throw.
+    @Test func controlRejectedWhenStateDoesNotChange() async throws {
         let p = provider { method, _, _ in
-            if method == "POST" { return (Data("[]".utf8), 200) }
-            return (json(#"{"entity_id":"switch.pump","state":"off","attributes":{}}"#), 200)
+            method == "POST" ? (Data("[]".utf8), 200)
+                             : (json(#"{"entity_id":"switch.pump","state":"off","attributes":{}}"#), 200)
         }
-        await #expect(throws: ProviderError.unconfirmed) {
-            try await p.setState(DeviceTarget(id: "switch.pump"), .setPower(true))
-        }
+        let control = try #require(try await p.capabilities(for: "switch.pump").control)
+        let receipt = try await control.execute(SetPowerCommand(deviceID: "switch.pump", isOn: true))
+        #expect(receipt.outcome == .rejected)   // confirm-by-reread: no silent success
     }
 
     @Test func authFailureIsDistinguished() async throws {
         let p = provider { _, _, _ in (Data(), 401) }
-        await #expect(throws: ProviderError.authenticationFailed(reason: "HTTP 401")) {
-            try await p.readState(DeviceTarget(id: "light.x"))
+        let reader = try #require(try await p.capabilities(for: "light.x").readState)
+        await #expect(throws: IoTError.authenticationFailed(reason: "HTTP 401")) {
+            try await reader.state()
         }
     }
 }

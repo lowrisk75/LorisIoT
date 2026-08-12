@@ -29,14 +29,14 @@ public final class HAURLSessionHTTP: NSObject, HAHTTP, URLSessionTaskDelegate, @
     }
 
     public func send(method: String, path: String, body: Data?) async throws -> (Data, Int) {
-        guard let url = URL(string: path, relativeTo: baseURL) else { throw ProviderError.notConfigured }
+        guard let url = URL(string: path, relativeTo: baseURL) else { throw IoTError.notConfigured }
         var req = URLRequest(url: url)
         req.httpMethod = method
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
         let (data, response) = try await session.data(for: req, delegate: self)
-        guard let http = response as? HTTPURLResponse else { throw ProviderError.invalidResponse }
+        guard let http = response as? HTTPURLResponse else { throw IoTError.invalidResponse }
         let capped = data.count > maxBytes ? data.prefix(maxBytes) : data
         return (Data(capped), http.statusCode)
     }

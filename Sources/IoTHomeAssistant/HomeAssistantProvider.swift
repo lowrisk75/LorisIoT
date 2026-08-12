@@ -1,29 +1,23 @@
 import Foundation
 import IoTCore
 
-/// Home Assistant provider — the pivot integration. Control + read via REST (with confirm-by-reread),
-/// live updates via the WebSocket (auth handshake + `state_changed` subscription, resilient through
-/// `RealtimeSocketClient`), and `.schedule` via an `input_datetime` helper the user's HA automation
-/// reacts to (the server-side pre-provisioning law).
-///
-/// Reaches thousands of third-party devices for free: anything HA integrates (Zigbee/Z-Wave/Thread via
-/// hubs, ESPHome, Tuya-via-HA) appears here as an entity.
-public actor HomeAssistantProvider: DeviceProvider, SchedulingProvider {
-    public nonisolated let id = "homeassistant"
+/// Monotonic local sequence for `StateRevision` (deterministic process order across capabilities).
+actor SequenceGen { private var n: UInt64 = 0; func next() -> UInt64 { n += 1; return n } }
+
+/// Home Assistant provider — the pivot integration. Exposes each HA entity as a `Device` with
+/// per-device capabilities (control/readState/subscribe, +schedule when an input_datetime helper is
+/// configured). Reaches Zigbee/Z-Wave/Thread/ESPHome/Tuya-via-HA for free.
+public actor HomeAssistantProvider: DeviceProvider {
+    public nonisolated let id: ProviderID = "home-assistant"
     public nonisolated let displayName = "Home Assistant"
-    public var capabilities: Set<DeviceCapability> { [.control, .readState, .subscribe, .schedule] }
 
     private let config: HAConfig
     private let token: String
-    private let rest: HARestClient
-    /// Optional `input_datetime.<name>` used to pre-provision a scheduled wake (nil → `.schedule` no-ops).
+    let rest: HARestClient
     private let wakeHelperEntity: String?
+    private let seq = SequenceGen()
+    private var connected = false
 
-    private var socket: RealtimeSocketClient<HAMessage>?
-    private var cache: [String: HAEntityState] = [:]
-
-    /// - Parameters:
-    ///   - http: injected for tests; defaults to a real `URLSession` client with the bearer token.
     public init(config: HAConfig, token: String, http: HAHTTP? = nil, wakeHelperEntity: String? = nil) {
         self.config = config
         self.token = token
@@ -31,104 +25,161 @@ public actor HomeAssistantProvider: DeviceProvider, SchedulingProvider {
         self.wakeHelperEntity = wakeHelperEntity
     }
 
-    // MARK: - DeviceProvider
+    public func connect() async throws { _ = try await rest.verify(); connected = true }
+    public func disconnect() async { connected = false }
 
-    public func connect() async throws { _ = try await rest.verify() }
-    public func disconnect() async { await socket?.stop(); socket = nil }
-
-    public func readState(_ target: DeviceTarget) async throws -> DeviceState {
-        if let cached = cache[target.id] { return cached.deviceState }
-        let s = try await rest.state(entityID: target.id)
-        cache[target.id] = s
-        return s.deviceState
+    /// One-shot snapshot of every entity as a `Device`.
+    public func devices() async throws -> [Device] {
+        try await rest.states().map { Self.device(from: $0, provider: id, canSchedule: wakeHelperEntity != nil) }
     }
 
-    /// Apply the command, then re-read and confirm — throws `.unconfirmed` if HA's state doesn't match.
-    @discardableResult
-    public func setState(_ target: DeviceTarget, _ command: DeviceCommand) async throws -> DeviceState {
-        let domain = haDomain(of: target.id)
-        switch command {
+    /// Per-device typed capability handles — no casts on the consumer side.
+    public func capabilities(for deviceID: DeviceID) async throws -> DeviceCapabilitySet {
+        let entityID = deviceID.rawValue
+        var descriptors: [CapabilityDescriptor] = [
+            CapabilityDescriptor(id: .readState, operations: [.readState]),
+            CapabilityDescriptor(id: .control, operations: [.control]),
+            CapabilityDescriptor(id: .subscribe, operations: [.subscribe]),
+        ]
+        var schedule: (any ScheduleCapability)?
+        if let helper = wakeHelperEntity {
+            descriptors.append(CapabilityDescriptor(id: .schedule, operations: [.schedule]))
+            schedule = HAScheduleCapability(rest: rest, deviceID: deviceID, helperEntity: helper)
+        }
+        return DeviceCapabilitySet(
+            descriptors: descriptors,
+            control: HAControlCapability(rest: rest, deviceID: deviceID, seq: seq),
+            readState: HAReadStateCapability(rest: rest, deviceID: deviceID, seq: seq),
+            schedule: schedule,
+            subscribe: HASubscribeCapability(config: config, token: token, deviceID: deviceID, seq: seq))
+    }
+
+    public func connectionEvents() async -> AsyncStream<ProviderConnectionEvent> {
+        let connected = self.connected, id = self.id
+        return AsyncStream { c in
+            c.yield(ProviderConnectionEvent(providerID: id, state: connected ? .connected : .disconnected))
+            c.finish()
+        }
+    }
+
+    static func device(from e: HAEntityState, provider: ProviderID, canSchedule: Bool) -> Device {
+        var caps = [CapabilityID.readState, .control, .subscribe]
+        if canSchedule { caps.append(.schedule) }
+        return Device(id: DeviceID(rawValue: e.entityID), providerID: provider, nativeID: e.entityID,
+                      name: e.friendlyName ?? e.entityID, kind: kind(for: e.entityID),
+                      capabilities: caps.map { CapabilityDescriptor(id: $0, operations: []) })
+    }
+
+    static func kind(for entityID: String) -> DeviceKind {
+        switch haDomain(of: entityID) {
+        case "light": return .light
+        case "switch": return .switchDevice
+        case "fan": return .fan
+        case "cover": return .cover
+        case "lock": return .lock
+        case "sensor", "binary_sensor": return .sensor
+        case "climate": return .thermostat
+        default: return .unknown
+        }
+    }
+}
+
+// MARK: - Capabilities
+
+actor HAReadStateCapability: ReadStateCapability {
+    public nonisolated let descriptor = CapabilityDescriptor(id: .readState, operations: [.readState])
+    private let rest: HARestClient; private let deviceID: DeviceID; private let seq: SequenceGen
+    init(rest: HARestClient, deviceID: DeviceID, seq: SequenceGen) { self.rest = rest; self.deviceID = deviceID; self.seq = seq }
+    func state() async throws -> DeviceState {
+        try await rest.state(entityID: deviceID.rawValue).deviceState(sequence: await seq.next())
+    }
+}
+
+actor HAControlCapability: ControlCapability {
+    public nonisolated let descriptor = CapabilityDescriptor(id: .control, operations: [.control])
+    private let rest: HARestClient; private let deviceID: DeviceID; private let seq: SequenceGen
+    init(rest: HARestClient, deviceID: DeviceID, seq: SequenceGen) { self.rest = rest; self.deviceID = deviceID; self.seq = seq }
+
+    /// Execute + confirm-by-reread. Outcome: `.applied` (confirmed), `.rejected` (state didn't change),
+    /// `.uncertain` (transport failed after the send may have happened — never silently "succeed").
+    func execute<C: DeviceCommand>(_ command: C) async throws -> CommandReceipt {
+        let domain = haDomain(of: deviceID.rawValue)
+        func receipt(_ outcome: CommandOutcome, _ state: DeviceState?) -> CommandReceipt {
+            CommandReceipt(commandID: command.id, deviceID: deviceID, outcome: outcome, state: state)
+        }
+        switch command.payload {
         case .setPower(let on):
-            try await rest.callService(domain: domain, service: on ? "turn_on" : "turn_off", entityID: target.id)
-            return try await confirm(target.id) { $0.power == on }
-        case .toggle:
-            try await rest.callService(domain: domain, service: "toggle", entityID: target.id)
-            return try await confirm(target.id) { $0.power != nil }
-        case .setLevel(let pct):
-            let p = max(0, min(100, pct))
-            try await rest.callService(domain: domain, service: "turn_on", entityID: target.id,
-                                       data: ["brightness_pct": p])
-            return try await confirm(target.id) { $0.power == true }
+            do { try await rest.callService(domain: domain, service: on ? "turn_on" : "turn_off", entityID: deviceID.rawValue) }
+            catch let e as IoTError where e == .authenticationFailed(reason: "HTTP 401") || e == .authenticationFailed(reason: "HTTP 403") { throw e }
+            catch { return receipt(.uncertain, nil) }
+            let s = try await rest.state(entityID: deviceID.rawValue)
+            return receipt(s.isOn == on ? .applied : .rejected, s.deviceState(sequence: await seq.next()))
+        case .setLevel(let interval):
+            do { try await rest.callService(domain: domain, service: "turn_on", entityID: deviceID.rawValue, data: ["brightness_pct": interval.percent]) }
+            catch { return receipt(.uncertain, nil) }
+            let s = try await rest.state(entityID: deviceID.rawValue)
+            return receipt(s.isOn == true ? .applied : .rejected, s.deviceState(sequence: await seq.next()))
+        default:
+            throw IoTError.notSupported("HA control supports power/level")
         }
     }
+}
 
-    /// Re-read the entity and validate the physical state against `predicate` (confirm-by-reread).
-    private func confirm(_ entityID: String, _ predicate: (DeviceState) -> Bool) async throws -> DeviceState {
-        let s = try await rest.state(entityID: entityID)
-        cache[entityID] = s
-        let ds = s.deviceState
-        guard predicate(ds) else { throw ProviderError.unconfirmed }
-        return ds
+/// `.schedule` via an `input_datetime` helper — the server-side pre-provisioning primitive.
+actor HAScheduleCapability: ScheduleCapability {
+    public nonisolated let descriptor = CapabilityDescriptor(id: .schedule, operations: [.schedule])
+    private let rest: HARestClient; private let deviceID: DeviceID; private let helperEntity: String
+    init(rest: HARestClient, deviceID: DeviceID, helperEntity: String) { self.rest = rest; self.deviceID = deviceID; self.helperEntity = helperEntity }
+
+    func schedules() async throws -> [DeviceSchedule] { [] }   // HA helper is opaque; we own one slot
+
+    func upsert(_ schedule: DeviceSchedule) async throws -> DeviceSchedule {
+        try await rest.setInputDatetime(entityID: helperEntity, isoDate: Self.iso(schedule.start))
+        return schedule
+    }
+    func removeSchedule(id: ScheduleID) async throws {
+        try await rest.setInputDatetime(entityID: helperEntity, isoDate: "1970-01-01 00:00:00")
+    }
+    static func iso(_ d: Date) -> String {
+        let f = DateFormatter(); f.locale = Locale(identifier: "en_US_POSIX"); f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f.string(from: d)
+    }
+}
+
+/// Live `state_changed` for one entity, over the resilient WebSocket (auth handshake + subscribe on
+/// every reconnect). Filters the shared stream to this device.
+actor HASubscribeCapability: SubscribeCapability {
+    public nonisolated let descriptor = CapabilityDescriptor(id: .subscribe, operations: [.subscribe])
+    private let config: HAConfig; private let token: String; private let deviceID: DeviceID; private let seq: SequenceGen
+    private var socket: RealtimeSocketClient<HAMessage>?
+    init(config: HAConfig, token: String, deviceID: DeviceID, seq: SequenceGen) {
+        self.config = config; self.token = token; self.deviceID = deviceID; self.seq = seq
     }
 
-    // MARK: - SchedulingProvider (input_datetime server-side pre-provisioning)
-
-    public func provision(_ schedule: DeviceSchedule) async throws -> ScheduleHandle {
-        guard let helper = wakeHelperEntity else {
-            throw ProviderError.notSupported("No input_datetime helper configured for scheduling")
+    func stateChanges() async -> AsyncThrowingStream<DeviceStateChange, any Error> {
+        guard let wsURL = config.websocketURL else {
+            return AsyncThrowingStream { $0.finish(throwing: IoTError.notConfigured) }
         }
-        let iso = Self.nextISO(hour: schedule.hour, minute: schedule.minute)
-        try await rest.setInputDatetime(entityID: helper, isoDate: iso)
-        return ScheduleHandle(helper)
-    }
-
-    public func clear(_ handle: ScheduleHandle) async {
-        // Set the helper far in the past so the user's automation treats it as inactive.
-        try? await rest.setInputDatetime(entityID: handle.rawValue, isoDate: "1970-01-01 00:00:00")
-    }
-
-    /// Next future "yyyy-MM-dd HH:mm:ss" (HA's input_datetime format) for hour:minute, local time.
-    static func nextISO(hour: Int, minute: Int, now: Date = Date(), calendar: Calendar = .current) -> String {
-        var comps = calendar.dateComponents([.year, .month, .day], from: now)
-        comps.hour = hour; comps.minute = minute; comps.second = 0
-        var date = calendar.date(from: comps) ?? now
-        if date <= now { date = calendar.date(byAdding: .day, value: 1, to: date) ?? date }
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "en_US_POSIX")
-        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        return f.string(from: date)
-    }
-
-    // MARK: - Live updates (WebSocket)
-
-    /// Start (or reuse) the resilient WebSocket and return a stream of entity-state updates. Feeds the
-    /// local cache so `readState` is instant. The auth handshake + subscribe run on every (re)connect.
-    public func liveStates() async throws -> AsyncStream<HAEntityState> {
-        guard let wsURL = config.websocketURL else { throw ProviderError.notConfigured }
-        let token = self.token
+        let token = self.token, wanted = deviceID.rawValue, seq = self.seq
         let client = RealtimeSocketClient<HAMessage>(
             makeTransport: { HAWebSocketTransport(url: wsURL) },
             decode: { HAMessage.decode($0) },
             onConnected: { transport in
-                // HA handshake: server → auth_required, client → auth, server → auth_ok, then subscribe.
-                _ = try await transport.receive()                       // auth_required
+                _ = try await transport.receive()                        // auth_required
                 try await transport.send(HAOutbound.auth(token: token))
-                let okFrame = try await transport.receive()
-                guard case .authOK = HAMessage.decode(okFrame) else {
-                    throw ProviderError.authenticationFailed(reason: "auth_invalid")
+                guard case .authOK = HAMessage.decode(try await transport.receive()) else {
+                    throw IoTError.authenticationFailed(reason: "auth_invalid")
                 }
                 try await transport.send(HAOutbound.subscribeStateChanged(id: 1))
             },
-            ping: { transport in try? await transport.send(HAOutbound.ping(id: 999)) }
-        )
+            ping: { transport in try? await transport.send(HAOutbound.ping(id: 999)) })
         self.socket = client
         let raw = await client.messages()
-        return AsyncStream { continuation in
+        return AsyncThrowingStream { continuation in
             let task = Task {
                 for await msg in raw {
-                    if case .stateChanged(let entity) = msg {
-                        self.updateCache(entity)
-                        continuation.yield(entity)
+                    if case .stateChanged(let e) = msg, e.entityID == wanted {
+                        continuation.yield(.snapshot(e.deviceState(sequence: await seq.next())))
                     }
                 }
                 continuation.finish()
@@ -136,6 +187,4 @@ public actor HomeAssistantProvider: DeviceProvider, SchedulingProvider {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
-
-    private func updateCache(_ entity: HAEntityState) { cache[entity.entityID] = entity }
 }

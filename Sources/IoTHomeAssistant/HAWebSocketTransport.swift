@@ -22,17 +22,17 @@ public actor HAWebSocketTransport: RealtimeTransport {
     }
 
     public func send(_ data: Data) async throws {
-        guard let task else { throw ProviderError.notConnected }
+        guard let task else { throw IoTError.notConnected }
         let text = String(data: data, encoding: .utf8) ?? ""
         try await task.send(.string(text))
     }
 
     public func receive() async throws -> Data {
-        guard let task else { throw ProviderError.notConnected }
+        guard let task else { throw IoTError.notConnected }
         switch try await task.receive() {
         case .string(let s): return Data(s.utf8)
         case .data(let d): return d
-        @unknown default: throw ProviderError.invalidResponse
+        @unknown default: throw IoTError.invalidResponse
         }
     }
 

@@ -21,14 +21,14 @@ actor MockTransport: RealtimeTransport {
     func close() async { closed = true }
 
     func receive() async throws -> Data {
-        if closed { throw ProviderError.cancelled }
+        if closed { throw IoTError.cancelled }
         if !frames.isEmpty { return frames.removeFirst() }
         if let endError { throw endError }
         if hangWhenEmpty {
             while !closed { try await Task.sleep(for: .milliseconds(20)) }  // suspend → freed on close
-            throw ProviderError.cancelled
+            throw IoTError.cancelled
         }
-        throw ProviderError.cancelled
+        throw IoTError.cancelled
     }
 }
 
@@ -40,7 +40,7 @@ actor Counter { private(set) var value = 0; func bump() { value += 1 } }
     @Test func deliversDecodedFramesFromASession() async throws {
         let payloads = ["a", "b", "c"].map { Data($0.utf8) }
         let client = RealtimeSocketClient<String>(
-            makeTransport: { MockTransport(frames: payloads, endError: ProviderError.cancelled) },
+            makeTransport: { MockTransport(frames: payloads, endError: IoTError.cancelled) },
             decode: { String(data: $0, encoding: .utf8) }
         )
         var received: [String] = []

@@ -28,12 +28,23 @@ public struct HAEntityState: Sendable, Equatable, Decodable {
         self.entityID = entityID; self.state = state; self.friendlyName = friendlyName; self.brightness = brightness
     }
 
-    /// Map to the vendor-neutral `DeviceState`. `unavailable`/`unknown` → not reachable.
-    public var deviceState: DeviceState {
-        let reachable = (state != "unavailable" && state != "unknown")
-        let power: Bool? = reachable ? (state == "on") : nil
-        let level: Int? = brightness.map { Int((Double($0) / 255.0 * 100).rounded()) }
-        return DeviceState(power: power, level: level, name: friendlyName, reachable: reachable)
+    /// Map to the vendor-neutral `DeviceState`. `unavailable`/`unknown` → offline.
+    public func deviceState(sequence: UInt64, observedAt: Date = Date()) -> DeviceState {
+        let available: DeviceAvailability = (state == "unavailable" || state == "unknown") ? .offline : .online
+        let primary: StateValue? = available == .online ? .bool(state == "on") : nil
+        var attrs: [String: StateAttribute] = [:]
+        if let brightness {
+            let pct = Int((Double(brightness) / 255.0 * 100).rounded())
+            attrs["level"] = StateAttribute(value: .integer(Int64(pct)), unit: .percent, displayName: "Brightness")
+        }
+        return DeviceState(deviceID: DeviceID(rawValue: entityID), availability: available,
+                           primaryValue: primary, attributes: attrs, observedAt: observedAt,
+                           origin: .bridge, revision: StateRevision(localSequence: sequence))
+    }
+
+    /// The device's on/off, or nil when offline/unknown.
+    public var isOn: Bool? {
+        (state == "unavailable" || state == "unknown") ? nil : (state == "on")
     }
 }
 

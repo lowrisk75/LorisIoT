@@ -1,85 +1,134 @@
 import Foundation
 
-/// What a provider can do. Gates what the app may ask for — the capability law: an app must never
-/// promise a timed action through a provider that lacks `.schedule`.
-public enum DeviceCapability: String, Sendable, Hashable, CaseIterable {
-    case control     // set on/off / value now
-    case readState   // read current state
-    case subscribe   // push live updates
-    case schedule    // pre-provision a timed action on an always-on system (device / server)
-}
+// MARK: - Typed identities (provider-scoped; "same MAC ≠ same device")
 
-/// A vendor-neutral device state. Every provider maps its wire format into this one `Sendable`
-/// value — the app never sees provider-specific shapes. `power` is optional to model "unknown"
-/// (never optimistic; see the confirm-by-reread contract on `DeviceProvider.setState`).
-public struct DeviceState: Sendable, Equatable {
-    public var power: Bool?          // on/off, nil = unknown
-    public var level: Int?           // 0…100 (brightness/position/speed), nil = n/a
-    public var name: String?
-    public var reachable: Bool
-    public var raw: [String: String] // provider-specific extras, stringly-typed to stay Sendable
-
-    public init(power: Bool? = nil, level: Int? = nil, name: String? = nil,
-                reachable: Bool = true, raw: [String: String] = [:]) {
-        self.power = power
-        self.level = level
-        self.name = name
-        self.reachable = reachable
-        self.raw = raw
-    }
-}
-
-/// A command to apply to a device.
-public enum DeviceCommand: Sendable, Equatable {
-    case setPower(Bool)
-    case setLevel(Int)          // 0…100
-    case toggle
-}
-
-/// Identifies which device/channel a command targets within a provider.
-public struct DeviceTarget: Sendable, Equatable, Hashable {
-    public let id: String       // provider-scoped device id
-    public let channel: Int     // relay/endpoint channel (0 when single)
-    public init(id: String, channel: Int = 0) { self.id = id; self.channel = channel }
-}
-
-/// A timed action to pre-provision on an always-on system (Shelly cron / HomeKit timer / HA
-/// input_datetime). `daily` mirrors the Shelly reality (cron, no one-shot date) — the caller
-/// re-provisions on each evaluation.
-public struct DeviceSchedule: Sendable, Equatable {
-    public enum Recurrence: Sendable, Equatable { case daily, weekly(Set<Int>) }  // weekday 1=Sun…7=Sat
-    public let target: DeviceTarget
-    public let command: DeviceCommand
-    public let hour: Int
-    public let minute: Int
-    public let recurrence: Recurrence
-
-    public init(target: DeviceTarget, command: DeviceCommand, hour: Int, minute: Int,
-                recurrence: Recurrence = .daily) {
-        self.target = target
-        self.command = command
-        self.hour = hour
-        self.minute = minute
-        self.recurrence = recurrence
-    }
-}
-
-/// Opaque handle to a provisioned schedule so the caller can replace/clear only its own job.
-public struct ScheduleHandle: Sendable, Equatable, Hashable {
+public struct ProviderID: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral, CustomStringConvertible {
     public let rawValue: String
-    public init(_ rawValue: String) { self.rawValue = rawValue }
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public var description: String { rawValue }
 }
 
-/// Normalized failure taxonomy. The auth/transport/decode distinction drives recovery: re-pair on
-/// `.authenticationFailed`, retry on transport errors.
-public enum ProviderError: Error, Sendable, Equatable {
-    case notConfigured
-    case notConnected
+public struct DeviceID: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral, CustomStringConvertible {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public var description: String { rawValue }
+}
+
+public struct CommandID: RawRepresentable, Codable, Hashable, Sendable, CustomStringConvertible {
+    public let rawValue: UUID
+    public init(rawValue: UUID = UUID()) { self.rawValue = rawValue }
+    public var description: String { rawValue.uuidString }
+}
+
+public struct CapabilityID: RawRepresentable, Codable, Hashable, Sendable, ExpressibleByStringLiteral, CustomStringConvertible {
+    public let rawValue: String
+    public init(rawValue: String) { self.rawValue = rawValue }
+    public init(stringLiteral value: String) { self.rawValue = value }
+    public var description: String { rawValue }
+    public static let control: Self = "iot.core.control"
+    public static let readState: Self = "iot.core.read-state"
+    public static let schedule: Self = "iot.core.schedule"
+    public static let subscribe: Self = "iot.core.subscribe"
+    public static let actions: Self = "iot.core.actions"
+}
+
+// MARK: - Closed, serializable value model
+
+public enum UnitSymbol: String, Codable, Hashable, Sendable {
+    case percent, celsius, fahrenheit, kelvin, watt, kilowattHour, volt, ampere, lux, second, degree, ppm, none
+}
+
+/// A JSON-like but closed & Sendable value — a provider can never inject a non-Sendable reference.
+public indirect enum StateValue: Codable, Hashable, Sendable {
+    case null, bool(Bool), integer(Int64), decimal(Double), string(String), data(Data), date(Date)
+    case array([StateValue]), object([String: StateValue])
+}
+
+public struct StateAttribute: Codable, Hashable, Sendable {
+    public let value: StateValue
+    public let unit: UnitSymbol?
+    public let displayName: String?
+    public init(value: StateValue, unit: UnitSymbol? = nil, displayName: String? = nil) {
+        self.value = value; self.unit = unit; self.displayName = displayName
+    }
+}
+
+public enum DeviceAvailability: String, Codable, Hashable, Sendable { case online, degraded, offline, unknown }
+public enum StateOrigin: String, Codable, Hashable, Sendable { case local, cloud, bridge, cache, optimistic }
+
+/// Never assume device clocks are synced. `localSequence` gives deterministic process order.
+public struct StateRevision: Codable, Hashable, Sendable, Comparable {
+    public let localSequence: UInt64
+    public let providerSequence: UInt64?
+    public init(localSequence: UInt64, providerSequence: UInt64? = nil) {
+        self.localSequence = localSequence; self.providerSequence = providerSequence
+    }
+    public static func < (l: StateRevision, r: StateRevision) -> Bool { l.localSequence < r.localSequence }
+}
+
+public struct DeviceState: Codable, Hashable, Sendable {
+    public let deviceID: DeviceID
+    public let availability: DeviceAvailability
+    public let primaryValue: StateValue?
+    public let attributes: [String: StateAttribute]
+    public let observedAt: Date
+    public let receivedAt: Date
+    public let origin: StateOrigin
+    public let revision: StateRevision
+    public init(deviceID: DeviceID, availability: DeviceAvailability, primaryValue: StateValue? = nil,
+                attributes: [String: StateAttribute] = [:], observedAt: Date, receivedAt: Date = Date(),
+                origin: StateOrigin, revision: StateRevision) {
+        self.deviceID = deviceID; self.availability = availability; self.primaryValue = primaryValue
+        self.attributes = attributes; self.observedAt = observedAt; self.receivedAt = receivedAt
+        self.origin = origin; self.revision = revision
+    }
+}
+
+// MARK: - Device + capability descriptors (what's POSSIBLE)
+
+public enum DeviceKind: String, Codable, Hashable, Sendable {
+    case bridge, light, outlet, switchDevice, sensor, thermostat, lock, cover, fan, camera, speaker, appliance, scene, unknown
+}
+
+public enum CapabilityOperation: String, Codable, Hashable, Sendable {
+    case control, readState, schedule, subscribe, invokeAction
+}
+
+public struct CapabilityDescriptor: Codable, Hashable, Sendable, Identifiable {
+    public let id: CapabilityID
+    public let operations: Set<CapabilityOperation>
+    public let metadata: [String: StateValue]
+    public init(id: CapabilityID, operations: Set<CapabilityOperation>, metadata: [String: StateValue] = [:]) {
+        self.id = id; self.operations = operations; self.metadata = metadata
+    }
+}
+
+public struct Device: Codable, Hashable, Sendable, Identifiable {
+    public let id: DeviceID
+    public let providerID: ProviderID
+    public let nativeID: String
+    public let name: String
+    public let kind: DeviceKind
+    public let manufacturer: String?
+    public let model: String?
+    public let firmwareVersion: String?
+    public let capabilities: [CapabilityDescriptor]
+    public init(id: DeviceID, providerID: ProviderID, nativeID: String, name: String, kind: DeviceKind,
+                manufacturer: String? = nil, model: String? = nil, firmwareVersion: String? = nil,
+                capabilities: [CapabilityDescriptor]) {
+        self.id = id; self.providerID = providerID; self.nativeID = nativeID; self.name = name
+        self.kind = kind; self.manufacturer = manufacturer; self.model = model
+        self.firmwareVersion = firmwareVersion; self.capabilities = capabilities
+    }
+}
+
+// MARK: - Plumbing error (transport/auth). Domain outcomes use CommandReceipt.
+
+public enum IoTError: Error, Sendable, Equatable {
+    case notConfigured, notConnected
     case authenticationFailed(reason: String)
-    case invalidResponse
-    case unconfirmed              // setState could not confirm the physical state (confirm-by-reread)
-    case timeout
-    case cancelled
-    case notSupported(String)
-    case transport(String)
+    case invalidResponse, unconfirmed, timeout, cancelled
+    case notSupported(String), transport(String)
 }

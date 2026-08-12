@@ -129,7 +129,7 @@ public actor RealtimeSocketClient<Message: Sendable> {
             await ping(transport)
             if now().timeIntervalSince(lastActivity) > config.staleAfter {
                 await transport.close()
-                throw ProviderError.timeout    // silent death → force reconnect
+                throw IoTError.timeout    // silent death → force reconnect
             }
         }
     }
