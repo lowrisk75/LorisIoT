@@ -82,6 +82,109 @@ struct MockRPC: ShellyRPC {
     }
 }
 
+@Suite struct ShellyCloudSecurityTests {
+    actor RecordingHTTP: ShellyCloudHTTP {
+        private(set) var request: URLRequest?
+        let data: Data
+        let status: Int
+
+        init(json: String, status: Int = 200) {
+            self.data = Data(json.utf8)
+            self.status = status
+        }
+
+        func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+            self.request = request
+            let response = HTTPURLResponse(url: request.url!, statusCode: status,
+                                           httpVersion: nil, headerFields: nil)!
+            return (data, response)
+        }
+
+        func recordedRequest() -> URLRequest? { request }
+    }
+
+    @Test func cloudHostRejectsCredentialExfiltrationShapes() {
+        #expect(ShellyCloudClient.normalizedHost("https://shelly-59-eu.shelly.cloud")
+                == "shelly-59-eu.shelly.cloud")
+        #expect(ShellyCloudClient.normalizedHost("https://api.shelly.cloud@attacker.invalid") == nil)
+        #expect(ShellyCloudClient.normalizedHost("https://shelly-59-eu.shelly.cloud/path") == nil)
+        #expect(ShellyCloudClient.normalizedHost("https://shelly-59-eu.shelly.cloud?next=attacker.invalid") == nil)
+        #expect(ShellyCloudClient.normalizedHost("http://shelly-59-eu.shelly.cloud") == nil)
+        #expect(ShellyCloudClient.normalizedHost("https://attacker.invalid") == nil)
+    }
+
+    @Test func listRequestEncodesSecretAndParsesFixturesFailClosed() async throws {
+        let http = RecordingHTTP(json: #"""
+        {"isok":true,"data":{"devices":{
+          "AABBCC":{"name":"Coffee","type":"SHPLG-S","online":1},
+          "DDEEFF":{"name":"Bedroom","code":"SNSW","online":false},
+          "112233":{"name":"Unknown state"},
+          "BAD":"not-an-object",
+          "":{"name":"missing id","online":true}
+        }}}
+        """#)
+
+        let devices = await ShellyCloudClient.listDevices(
+            server: "shelly-59-eu.shelly.cloud", authKey: "a&b+c=", http: http)
+
+        #expect(devices.map(\.id) == ["ddeeff", "aabbcc", "112233"])
+        #expect(devices.first { $0.id == "aabbcc" }?.online == true)
+        #expect(devices.first { $0.id == "ddeeff" }?.type == "SNSW")
+        #expect(devices.first { $0.id == "112233" }?.online == false)
+
+        let request = try #require(await http.recordedRequest())
+        #expect(request.url?.absoluteString == "https://shelly-59-eu.shelly.cloud/interface/device/list")
+        #expect(request.httpMethod == "POST")
+        #expect(request.value(forHTTPHeaderField: "Content-Type") == "application/x-www-form-urlencoded")
+        let requestBody = try #require(request.httpBody)
+        #expect(String(data: requestBody, encoding: .utf8) == "auth_key=a%26b%2Bc%3D")
+    }
+
+    @Test func listRejectsUnsuccessfulResponses() async {
+        let rejected = RecordingHTTP(json: #"{"isok":false,"data":{"devices":{}}}"#)
+        #expect(await ShellyCloudClient.listDevices(
+            server: "shelly-59-eu.shelly.cloud", authKey: "x", http: rejected).isEmpty)
+
+        let error = RecordingHTTP(json: #"{"isok":true,"data":{"devices":{}}}"#, status: 401)
+        #expect(await ShellyCloudClient.listDevices(
+            server: "shelly-59-eu.shelly.cloud", authKey: "x", http: error).isEmpty)
+    }
+
+    @Test func setSwitchEncodesSecretInQueryAndBuildsJSONBody() async throws {
+        let http = RecordingHTTP(json: "{}")
+        let ok = await ShellyCloudClient.setSwitch(
+            server: "https://shelly-59-eu.shelly.cloud/", authKey: "a&b+c=",
+            deviceID: "aabbcc", channel: 2, on: true, http: http)
+        #expect(ok)
+
+        let request = try #require(await http.recordedRequest())
+        let requestURL = try #require(request.url)
+        let components = try #require(URLComponents(url: requestURL, resolvingAgainstBaseURL: false))
+        #expect(components.host == "shelly-59-eu.shelly.cloud")
+        #expect(components.path == "/v2/devices/api/set/switch")
+        #expect(components.queryItems == [URLQueryItem(name: "auth_key", value: "a&b+c=")])
+        let bodyData = try #require(request.httpBody)
+        let body = try #require(try JSONSerialization.jsonObject(with: bodyData) as? [String: Any])
+        #expect(body["id"] as? String == "aabbcc")
+        #expect(body["channel"] as? Int == 2)
+        #expect(body["on"] as? Bool == true)
+    }
+
+    @Test func productionTransportRejectsEveryRedirect() {
+        let transport = ShellyCloudURLSessionHTTP()
+        let original = URL(string: "https://shelly-59-eu.shelly.cloud/interface/device/list")!
+        let response = HTTPURLResponse(url: original, statusCode: 302, httpVersion: nil,
+                                       headerFields: ["Location": "https://attacker.invalid/"])!
+        let redirected = URLRequest(url: URL(string: "https://attacker.invalid/")!)
+        var followed: URLRequest? = redirected
+        transport.urlSession(URLSession.shared, task: URLSession.shared.dataTask(with: original),
+                             willPerformHTTPRedirection: response, newRequest: redirected) {
+            followed = $0
+        }
+        #expect(followed == nil)
+    }
+}
+
 // MARK: - BLE-RPC framing (pure — the GATT shell is device-gated)
 
 @Suite struct ShellyBLEFramingTests {

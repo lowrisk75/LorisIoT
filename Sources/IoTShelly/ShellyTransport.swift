@@ -41,7 +41,7 @@ public struct ShellyURLSessionRPC: ShellyRPC {
 }
 
 /// One device as reported by the Shelly Cloud account (for the "import from cloud" picker). `id` is
-/// the cloud device id (lowercased, no separators — same value used as the control `deviceID`).
+/// the lowercased response-map key, reused unchanged as the control `deviceID`.
 public struct ShellyCloudDevice: Sendable, Hashable, Identifiable {
     public let id: String
     public let name: String
@@ -54,59 +54,150 @@ public struct ShellyCloudDevice: Sendable, Hashable, Identifiable {
     public var displayName: String { name.isEmpty ? id : name }
 }
 
+/// Injectable HTTP seam for Shelly Cloud. Keeping the secret-bearing request behind this boundary
+/// makes URL construction and response parsing fixture-testable without contacting an account.
+protocol ShellyCloudHTTP: Sendable {
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse)
+}
+
+/// Ephemeral, cookie-free Cloud transport. Redirects are rejected because both Cloud endpoints
+/// carry the authorization key and must never replay it to a different authority.
+final class ShellyCloudURLSessionHTTP: NSObject, ShellyCloudHTTP, URLSessionTaskDelegate, @unchecked Sendable {
+    private let maxResponseBytes: Int
+    private let session: URLSession
+
+    init(maxResponseBytes: Int = 1024 * 1024) {
+        self.maxResponseBytes = maxResponseBytes
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 12
+        configuration.timeoutIntervalForResource = 20
+        configuration.httpCookieStorage = nil
+        configuration.httpShouldSetCookies = false
+        self.session = URLSession(configuration: configuration)
+    }
+
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let (data, response) = try await session.data(for: request, delegate: self)
+        guard let http = response as? HTTPURLResponse, data.count <= maxResponseBytes else {
+            throw IoTError.invalidResponse
+        }
+        return (data, http)
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask,
+                    willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest,
+                    completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
+}
+
 /// Shelly **Cloud** Control API v2 — remote on/off only (no scheduling). Used as a fallback when the
 /// device isn't reachable on the LAN. Ported from Velya `ShellyCloudClient`.
 public enum ShellyCloudClient {
 
-    /// Normalise a user-entered cloud server (strip scheme + trailing slashes). Empty → nil.
+    /// Accept only a bare Shelly tenant host or its HTTPS URI. Reject credentials, custom ports,
+    /// paths, queries and fragments so an authorization key cannot be redirected by crafted input.
     static func normalizedHost(_ server: String) -> String? {
-        var s = server.trimmingCharacters(in: .whitespaces)
-        if let r = s.range(of: "://") { s = String(s[r.upperBound...]) }
-        s = s.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        return s.isEmpty ? nil : s
+        let value = server.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        let candidate = value.contains("://") ? value : "https://\(value)"
+        guard let components = URLComponents(string: candidate),
+              components.scheme?.lowercased() == "https",
+              let rawHost = components.host, !rawHost.isEmpty,
+              components.user == nil, components.password == nil, components.port == nil,
+              components.query == nil, components.fragment == nil,
+              components.path.isEmpty || components.path == "/" else { return nil }
+        let host = rawHost.lowercased()
+        guard host == "shelly.cloud" || host.hasSuffix(".shelly.cloud") else { return nil }
+        return host
+    }
+
+    private static func endpoint(host: String, path: String,
+                                 queryItems: [URLQueryItem] = []) -> URL? {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = host
+        components.path = path
+        if queryItems.isEmpty {
+            components.percentEncodedQuery = nil
+        } else {
+            guard let query = formQuery(queryItems) else { return nil }
+            components.percentEncodedQuery = query
+        }
+        return components.url
+    }
+
+    private static func formQuery(_ items: [URLQueryItem]) -> String? {
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
+        var pairs: [String] = []
+        for item in items {
+            guard let name = item.name.addingPercentEncoding(withAllowedCharacters: allowed),
+                  let value = (item.value ?? "").addingPercentEncoding(withAllowedCharacters: allowed) else {
+                return nil
+            }
+            pairs.append("\(name)=\(value)")
+        }
+        return pairs.joined(separator: "&")
+    }
+
+    private static func formBody(_ items: [URLQueryItem]) -> Data? {
+        formQuery(items).map { Data($0.utf8) }
     }
 
     /// Enumerate the account's devices via `POST /interface/device/list` (form `auth_key`). Returns
     /// `[]` on any auth/transport/parse failure — the picker treats empty as "nothing to import,
     /// check your key". Parsing is tolerant: Shelly nests devices under `data.devices` keyed by id.
     public static func listDevices(server: String, authKey: String) async -> [ShellyCloudDevice] {
+        await listDevices(server: server, authKey: authKey, http: ShellyCloudURLSessionHTTP())
+    }
+
+    static func listDevices(server: String, authKey: String,
+                            http: any ShellyCloudHTTP) async -> [ShellyCloudDevice] {
         guard let host = normalizedHost(server), !authKey.isEmpty,
-              let url = URL(string: "https://\(host)/interface/device/list") else { return [] }
+              let url = endpoint(host: host, path: "/interface/device/list"),
+              let body = formBody([URLQueryItem(name: "auth_key", value: authKey)]) else { return [] }
         var r = URLRequest(url: url); r.httpMethod = "POST"; r.timeoutInterval = 12
         r.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
-        let escaped = authKey.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? authKey
-        r.httpBody = Data("auth_key=\(escaped)".utf8)
-        guard let (data, resp) = try? await URLSession.shared.data(for: r),
-              let http = resp as? HTTPURLResponse, (200...299).contains(http.statusCode),
+        r.httpBody = body
+        guard let (data, response) = try? await http.data(for: r),
+              (200...299).contains(response.statusCode),
               let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              (root["isok"] as? Bool) != false,
+              root["isok"] as? Bool == true,
               let container = root["data"] as? [String: Any],
               let devices = container["devices"] as? [String: Any] else { return [] }
 
         return devices.compactMap { id, raw -> ShellyCloudDevice? in
-            let d = raw as? [String: Any] ?? [:]
+            guard !id.isEmpty, let d = raw as? [String: Any] else { return nil }
             let name = (d["name"] as? String) ?? ""
             let type = (d["type"] as? String) ?? (d["code"] as? String) ?? ""
-            // `online` is 1/0 or bool depending on firmware; absent → assume reachable.
+            // `online` is 1/0 or bool depending on firmware; absent or malformed → fail closed.
             let online: Bool = {
                 if let b = d["online"] as? Bool { return b }
                 if let n = d["online"] as? Int { return n != 0 }
-                return true
+                return false
             }()
             return ShellyCloudDevice(id: id.lowercased(), name: name, type: type, online: online)
-        }.sorted { $0.displayName.localizedCaseInsensitiveCompare($1.displayName) == .orderedAscending }
+        }.sorted {
+            let order = $0.displayName.localizedCaseInsensitiveCompare($1.displayName)
+            return order == .orderedSame ? $0.id < $1.id : order == .orderedAscending
+        }
     }
 
     public static func setSwitch(server: String, authKey: String, deviceID: String, channel: Int, on: Bool) async -> Bool {
-        var hostStr = server.trimmingCharacters(in: .whitespaces)
-        if let r = hostStr.range(of: "://") { hostStr = String(hostStr[r.upperBound...]) }
-        hostStr = hostStr.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard !hostStr.isEmpty, !authKey.isEmpty, !deviceID.isEmpty,
-              let url = URL(string: "https://\(hostStr)/v2/devices/api/set/switch?auth_key=\(authKey)") else { return false }
+        await setSwitch(server: server, authKey: authKey, deviceID: deviceID,
+                        channel: channel, on: on, http: ShellyCloudURLSessionHTTP())
+    }
+
+    static func setSwitch(server: String, authKey: String, deviceID: String, channel: Int, on: Bool,
+                          http: any ShellyCloudHTTP) async -> Bool {
+        guard let host = normalizedHost(server), !authKey.isEmpty, !deviceID.isEmpty,
+              let url = endpoint(host: host, path: "/v2/devices/api/set/switch",
+                                 queryItems: [URLQueryItem(name: "auth_key", value: authKey)]) else { return false }
         var r = URLRequest(url: url); r.httpMethod = "POST"; r.timeoutInterval = 10
         r.setValue("application/json", forHTTPHeaderField: "Content-Type")
         r.httpBody = try? JSONSerialization.data(withJSONObject: ["id": deviceID, "channel": channel, "on": on])
-        guard let (_, resp) = try? await URLSession.shared.data(for: r), let http = resp as? HTTPURLResponse else { return false }
-        return (200...299).contains(http.statusCode)
+        guard let (_, response) = try? await http.data(for: r) else { return false }
+        return (200...299).contains(response.statusCode)
     }
 }
