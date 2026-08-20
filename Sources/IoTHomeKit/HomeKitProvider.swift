@@ -227,10 +227,10 @@ actor HomeKitScheduleCapability: ScheduleCapability {
         #if canImport(HomeKit)
         handle = await provider.provisionTimer(deviceID, on: on, fireDate: schedule.start)
         guard handle != nil else { throw IoTError.notSupported("HomeKit trigger provisioning failed (no hub?)") }
+        return schedule
         #else
         throw IoTError.notSupported("HomeKit unavailable on this platform")
         #endif
-        return schedule
     }
     func removeSchedule(id: ScheduleID) async throws {
         #if canImport(HomeKit)

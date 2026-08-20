@@ -32,7 +32,6 @@ public actor HomeAssistantProvider: DeviceProvider {
 
     /// Per-device typed capability handles — no casts on the consumer side.
     public func capabilities(for deviceID: DeviceID) async throws -> DeviceCapabilitySet {
-        let entityID = deviceID.rawValue
         var descriptors: [CapabilityDescriptor] = [
             CapabilityDescriptor(id: .readState, operations: [.readState]),
             CapabilityDescriptor(id: .control, operations: [.control]),

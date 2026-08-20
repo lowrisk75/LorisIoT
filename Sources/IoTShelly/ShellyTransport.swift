@@ -145,27 +145,52 @@ public enum ShellyCloudClient {
         formQuery(items).map { Data($0.utf8) }
     }
 
-    /// Enumerate the account's devices via `POST /interface/device/list` (form `auth_key`). Returns
-    /// `[]` on any auth/transport/parse failure — the picker treats empty as "nothing to import,
-    /// check your key". Parsing is tolerant: Shelly nests devices under `data.devices` keyed by id.
+    /// Compatibility API for callers that intentionally collapse Cloud failures to an empty list.
     public static func listDevices(server: String, authKey: String) async -> [ShellyCloudDevice] {
-        await listDevices(server: server, authKey: authKey, http: ShellyCloudURLSessionHTTP())
+        (try? await fetchDevices(server: server, authKey: authKey)) ?? []
     }
 
     static func listDevices(server: String, authKey: String,
                             http: any ShellyCloudHTTP) async -> [ShellyCloudDevice] {
+        (try? await fetchDevices(server: server, authKey: authKey, http: http)) ?? []
+    }
+
+    /// Enumerate the account's devices via `POST /interface/device/list` (form `auth_key`). Unlike
+    /// `listDevices`, this API preserves configuration, authentication, transport and parse errors
+    /// so a consumer can distinguish a genuinely empty account from a failed request.
+    public static func fetchDevices(server: String, authKey: String) async throws -> [ShellyCloudDevice] {
+        try await fetchDevices(server: server, authKey: authKey, http: ShellyCloudURLSessionHTTP())
+    }
+
+    static func fetchDevices(server: String, authKey: String,
+                             http: any ShellyCloudHTTP) async throws -> [ShellyCloudDevice] {
         guard let host = normalizedHost(server), !authKey.isEmpty,
               let url = endpoint(host: host, path: "/interface/device/list"),
-              let body = formBody([URLQueryItem(name: "auth_key", value: authKey)]) else { return [] }
+              let body = formBody([URLQueryItem(name: "auth_key", value: authKey)]) else {
+            throw IoTError.notConfigured
+        }
         var r = URLRequest(url: url); r.httpMethod = "POST"; r.timeoutInterval = 12
         r.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
         r.httpBody = body
-        guard let (data, response) = try? await http.data(for: r),
-              (200...299).contains(response.statusCode),
-              let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+        let data: Data
+        let response: HTTPURLResponse
+        do {
+            (data, response) = try await http.data(for: r)
+        } catch {
+            throw IoTError.transport("Shelly Cloud request failed")
+        }
+        guard (200...299).contains(response.statusCode) else {
+            if response.statusCode == 401 || response.statusCode == 403 {
+                throw IoTError.authenticationFailed(reason: "Shelly Cloud")
+            }
+            throw IoTError.transport("Shelly Cloud HTTP \(response.statusCode)")
+        }
+        guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
               root["isok"] as? Bool == true,
               let container = root["data"] as? [String: Any],
-              let devices = container["devices"] as? [String: Any] else { return [] }
+              let devices = container["devices"] as? [String: Any] else {
+            throw IoTError.invalidResponse
+        }
 
         return devices.compactMap { id, raw -> ShellyCloudDevice? in
             guard !id.isEmpty, let d = raw as? [String: Any] else { return nil }

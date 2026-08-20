@@ -150,6 +150,30 @@ struct MockRPC: ShellyRPC {
             server: "shelly-59-eu.shelly.cloud", authKey: "x", http: error).isEmpty)
     }
 
+    @Test func fetchDevicesDistinguishesConfigurationAuthenticationAndMalformedPayload() async {
+        let empty = RecordingHTTP(json: #"{"isok":true,"data":{"devices":{}}}"#)
+        await #expect(throws: IoTError.notConfigured) {
+            _ = try await ShellyCloudClient.fetchDevices(
+                server: "attacker.invalid", authKey: "x", http: empty)
+        }
+
+        let unauthorized = RecordingHTTP(json: #"{"isok":false}"#, status: 401)
+        await #expect(throws: IoTError.authenticationFailed(reason: "Shelly Cloud")) {
+            _ = try await ShellyCloudClient.fetchDevices(
+                server: "shelly-59-eu.shelly.cloud", authKey: "x", http: unauthorized)
+        }
+
+        let malformed = RecordingHTTP(json: #"{"isok":true,"data":{}}"#)
+        await #expect(throws: IoTError.invalidResponse) {
+            _ = try await ShellyCloudClient.fetchDevices(
+                server: "shelly-59-eu.shelly.cloud", authKey: "x", http: malformed)
+        }
+
+        let devices = try? await ShellyCloudClient.fetchDevices(
+            server: "shelly-59-eu.shelly.cloud", authKey: "x", http: empty)
+        #expect(devices == [])
+    }
+
     @Test func setSwitchEncodesSecretInQueryAndBuildsJSONBody() async throws {
         let http = RecordingHTTP(json: "{}")
         let ok = await ShellyCloudClient.setSwitch(
