@@ -299,7 +299,23 @@ public struct AdaptiveLatencyProber: EndpointProber {
         self.headers = headers
     }
 
+    /// A probe measures transport reachability, not whether the caller's
+    /// credentials have completed the device's login flow. An authenticated
+    /// origin can legitimately answer 401 to a stateless HEAD, and some
+    /// proxies reject HEAD with 405 while accepting real GETs. Both prove
+    /// DNS, TLS and the HTTP origin are alive.
+    ///
+    /// 403 is deliberately excluded: it usually means a zero-trust service
+    /// token or header is missing or rejected, which is not reachability.
+    ///
+    /// Ported from Lumen's ConnectionManager (2026-09), where treating 401 as
+    /// unreachable made every auth-enabled Frigate server look down.
+    public static func isReachableHTTPStatus(_ statusCode: Int) -> Bool {
+        (200...399).contains(statusCode) || statusCode == 401 || statusCode == 405
+    }
+
     /// Visible for testing.
+
     static func adaptiveTimeout(for url: URL) -> Double {
         guard let host = url.host() else { return 4 }
         if host.hasSuffix(".ts.net") || host.hasPrefix("100.") { return 5 }
@@ -331,7 +347,8 @@ public struct AdaptiveLatencyProber: EndpointProber {
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         do {
             let (_, response) = try await URLSession.shared.data(for: request)
-            guard let http = response as? HTTPURLResponse, (200...399).contains(http.statusCode) else { return nil }
+            guard let http = response as? HTTPURLResponse,
+                  Self.isReachableHTTPStatus(http.statusCode) else { return nil }
             return Date().timeIntervalSince(start)
         } catch {
             return nil
@@ -361,7 +378,7 @@ public struct AdaptiveLatencyProber: EndpointProber {
             let statusLine = text.prefix { $0 != "\r" && $0 != "\n" }
             let parts = statusLine.split(separator: " ", maxSplits: 2)
             guard parts.count >= 2, let code = Int(parts[1]) else { return false }
-            return (200...399).contains(code)
+            return Self.isReachableHTTPStatus(code)
         } catch {
             return false
         }
