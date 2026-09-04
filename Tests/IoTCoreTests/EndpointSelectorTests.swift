@@ -207,7 +207,7 @@ private func endpoint(_ id: String, ssidLock: String? = nil, enabled: Bool = tru
     }
 
     @Test func privateHostDetectionCoversRFC1918() {
-        #expect(AdaptiveLatencyProber.isPrivateHost("10.9.8.8"))
+        #expect(AdaptiveLatencyProber.isPrivateHost("10.0.0.8"))
         #expect(AdaptiveLatencyProber.isPrivateHost("172.16.0.1"))
         #expect(AdaptiveLatencyProber.isPrivateHost("172.31.255.255"))
         #expect(!AdaptiveLatencyProber.isPrivateHost("172.32.0.1"))

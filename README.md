@@ -1,13 +1,13 @@
 # LorisIoT
 
-Shared IoT framework for LorisLabs Apple apps (Velya · Éclair · Lumen · Piscine).
-**Internal / all-rights-reserved** — not for public distribution.
+Shared IoT framework for Apple platforms — the device, networking and safety layer
+behind the LorisLabs apps (Velya · Éclair · Lumen · Piscine).
+
+Licensed under Apache 2.0.
 
 Swift 6 strict concurrency · iOS 17+ / macOS 14+ / watchOS 10+ / tvOS 17+ / visionOS 1+ · zero
 runtime dependencies in `IoTCore`.
 
-Design + research: `~/GitHub/iot-framework/` (`IoTKit-DESIGN.md`, 22 deep-research reports, and the
-`LorisIoT` NotebookLM).
 
 ## Architecture
 
