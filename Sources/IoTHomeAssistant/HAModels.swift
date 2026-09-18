@@ -8,43 +8,58 @@ public struct HAEntityState: Sendable, Equatable, Decodable {
     public let state: String
     public let friendlyName: String?
     public let brightness: Int?     // HA reports 0…255
+    public let lastUpdated: Date?
+    public let unitOfMeasurement: String?
 
-    enum CodingKeys: String, CodingKey { case entityID = "entity_id", state, attributes }
-    enum AttrKeys: String, CodingKey { case friendlyName = "friendly_name", brightness }
+    enum CodingKeys: String, CodingKey { case entityID = "entity_id", state, attributes, lastUpdated = "last_updated" }
+    enum AttrKeys: String, CodingKey { case friendlyName = "friendly_name", brightness, unitOfMeasurement = "unit_of_measurement" }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         entityID = try c.decode(String.self, forKey: .entityID)
         state = try c.decode(String.self, forKey: .state)
+        if let raw = try c.decodeIfPresent(String.self, forKey: .lastUpdated) {
+            lastUpdated = (try? Date.ISO8601FormatStyle(includingFractionalSeconds: true).parse(raw))
+                ?? (try? Date.ISO8601FormatStyle().parse(raw))
+        } else { lastUpdated = nil }
         if let a = try? c.nestedContainer(keyedBy: AttrKeys.self, forKey: .attributes) {
             friendlyName = try? a.decodeIfPresent(String.self, forKey: .friendlyName)
             brightness = try? a.decodeIfPresent(Int.self, forKey: .brightness)
+            unitOfMeasurement = try? a.decodeIfPresent(String.self, forKey: .unitOfMeasurement)
         } else {
-            friendlyName = nil; brightness = nil
+            friendlyName = nil; brightness = nil; unitOfMeasurement = nil
         }
     }
 
-    public init(entityID: String, state: String, friendlyName: String? = nil, brightness: Int? = nil) {
+    public init(entityID: String, state: String, friendlyName: String? = nil, brightness: Int? = nil, lastUpdated: Date? = nil,
+                unitOfMeasurement: String? = nil) {
         self.entityID = entityID; self.state = state; self.friendlyName = friendlyName; self.brightness = brightness
+        self.lastUpdated = lastUpdated
+        self.unitOfMeasurement = unitOfMeasurement
     }
 
     /// Map to the vendor-neutral `DeviceState`. `unavailable`/`unknown` → offline.
     public func deviceState(sequence: UInt64, observedAt: Date = Date()) -> DeviceState {
         let available: DeviceAvailability = (state == "unavailable" || state == "unknown") ? .offline : .online
-        let primary: StateValue? = available == .online ? .bool(state == "on") : nil
+        let primary: StateValue?
+        if available != .online { primary = nil }
+        else if let isOn { primary = .bool(isOn) }
+        else if let number = Double(state), number.isFinite { primary = .decimal(number) }
+        else { primary = .string(state) }
         var attrs: [String: StateAttribute] = [:]
         if let brightness {
             let pct = Int((Double(brightness) / 255.0 * 100).rounded())
             attrs["level"] = StateAttribute(value: .integer(Int64(pct)), unit: .percent, displayName: "Brightness")
         }
         return DeviceState(deviceID: DeviceID(rawValue: entityID), availability: available,
-                           primaryValue: primary, attributes: attrs, observedAt: observedAt,
+                           primaryValue: primary, primaryUnit: UnitSymbol.from(symbol: unitOfMeasurement),
+                           attributes: attrs, observedAt: lastUpdated ?? observedAt,
                            origin: .bridge, revision: StateRevision(localSequence: sequence))
     }
 
     /// The device's on/off, or nil when offline/unknown.
     public var isOn: Bool? {
-        (state == "unavailable" || state == "unknown") ? nil : (state == "on")
+        state == "on" ? true : (state == "off" ? false : nil)
     }
 }
 
@@ -62,6 +77,8 @@ public enum HAMessage: Sendable {
     case authInvalid(String)
     case result(id: Int, success: Bool)
     case stateChanged(HAEntityState)
+    case states(id: Int, entities: [HAEntityState])
+    case entityRemoved(String)
     case pong(id: Int)
     case other(type: String)
 
@@ -74,8 +91,17 @@ public enum HAMessage: Sendable {
         case "auth_ok": return .authOK
         case "auth_invalid": return .authInvalid((obj["message"] as? String) ?? "auth invalid")
         case "pong": return .pong(id: (obj["id"] as? Int) ?? 0)
-        case "result": return .result(id: (obj["id"] as? Int) ?? 0, success: (obj["success"] as? Bool) ?? false)
+        case "result":
+            if obj["success"] as? Bool == true, let values = obj["result"] as? [[String: Any]],
+               let data = try? JSONSerialization.data(withJSONObject: values),
+               let states = try? JSONDecoder().decode([HAEntityState].self, from: data) {
+                return .states(id: (obj["id"] as? Int) ?? 0, entities: states)
+            }
+            return .result(id: (obj["id"] as? Int) ?? 0, success: (obj["success"] as? Bool) ?? false)
         case "event":
+            if let event = obj["event"] as? [String: Any], event["event_type"] as? String == "state_changed",
+               let payload = event["data"] as? [String: Any], payload["new_state"] is NSNull,
+               let id = payload["entity_id"] as? String { return .entityRemoved(id) }
             guard let event = obj["event"] as? [String: Any],
                   (event["event_type"] as? String) == "state_changed",
                   let dataDict = event["data"] as? [String: Any],

@@ -19,15 +19,25 @@ public struct HAConfig: Sendable, Equatable {
         var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return nil }
         if s.hasSuffix("/") { s.removeLast() }
-        if !s.hasPrefix("http://") && !s.hasPrefix("https://") { s = "https://" + s }
-        return URL(string: s)
+        if !s.contains("://") { s = "https://" + s }
+        guard var c = URLComponents(string: s),
+              let scheme = c.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = c.host, !host.isEmpty,
+              c.user == nil, c.password == nil, c.query == nil, c.fragment == nil,
+              c.port.map({ (1...65535).contains($0) }) ?? true else { return nil }
+        // Explicit http:// is honoured only where the token cannot cross a public network in cleartext.
+        guard scheme == "https" || HTTPOrigin.isPrivateHost(host) else { return nil }
+        c.scheme = scheme
+        return c.url
     }
 
     /// The `ws(s)://…/api/websocket` URL derived from `baseURL`.
     public var websocketURL: URL? {
+        guard Self.normalize(baseURL.absoluteString) != nil else { return nil }
         var comps = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)
-        comps?.scheme = (baseURL.scheme == "http") ? "ws" : "wss"
-        comps?.path = "/api/websocket"
+        comps?.scheme = (baseURL.scheme?.lowercased() == "http") ? "ws" : "wss"
+        let prefix = baseURL.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        comps?.path = prefix.isEmpty ? "/api/websocket" : "/\(prefix)/api/websocket"
         return comps?.url
     }
 }

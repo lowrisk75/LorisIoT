@@ -75,22 +75,77 @@ actor Counter { private(set) var value = 0; func bump() { value += 1 } }
 
 @Suite struct RealtimeSocketClientDisconnectHookTests {
 
-    @Test func onDisconnectedFiresOnEachSessionEndBeforeBackoff() async throws {
+    @Test func stoppingClosesAnUncooperativeReceive() async throws {
+        let transport = CloseOnlyTransport()
+        let client = RealtimeSocketClient<String>(makeTransport: { transport }, decode: { _ in nil })
+        let stream = await client.messages()
+        for _ in 0..<100 where !(await transport.waiting) {
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        await client.stop()
+        try await Task.sleep(for: .milliseconds(20))
+        #expect(await transport.wasClosed)
+        await transport.close() // Always release the test transport, including a failing baseline.
+        for await _ in stream {}
+    }
+
+    @Test(arguments: [Duration.zero, .milliseconds(400)])
+    func onDisconnectedFiresOnEachSessionEndBeforeBackoff(startDelay: Duration) async throws {
         // Two short sessions → the hook must fire per session end (LR-M04 disconnect edge).
         let disconnects = Counter()
+        let hooks = AsyncStream<Void>.makeStream(bufferingPolicy: .bufferingNewest(2))
         let config = RealtimeSocketClient<String>.Config(
             retry: RetryPolicy(backoff: [0.02], stableSessionSeconds: 0, steadyStateSeconds: 0.02),
             staleAfter: 5, pingEvery: 5)
         let client = RealtimeSocketClient<String>(
             config: config,
-            makeTransport: { MockTransport(frames: [Data("x".utf8)], endError: IoTError.cancelled) },
+            makeTransport: {
+                if startDelay > .zero { try? await Task.sleep(for: startDelay) }
+                return MockTransport(frames: [Data("x".utf8)], endError: IoTError.cancelled)
+            },
             decode: { String(data: $0, encoding: .utf8) },
-            onDisconnected: { await disconnects.bump() }
+            onDisconnected: { await disconnects.bump(); hooks.continuation.yield() }
         )
         let stream = await client.messages()
-        try await Task.sleep(for: .milliseconds(300))
-        await client.stop()
-        for await _ in stream {}
+        // Observe two actual session ends before stopping. A hook caused by stop() must not
+        // make this test pass. The deadline bounds a broken implementation, not performance.
+        let receivedTwo = await withTaskGroup(of: Bool.self) { group in
+            group.addTask {
+                var count = 0
+                for await _ in hooks.stream {
+                    count += 1
+                    if count == 2 { return true }
+                }
+                return false
+            }
+            group.addTask {
+                try? await Task.sleep(for: .seconds(5))
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
+        }
+        #expect(receivedTwo)
         #expect(await disconnects.value >= 2)
+        await client.stop()
+        hooks.continuation.finish()
+        for await _ in stream {}
+    }
+}
+
+private actor CloseOnlyTransport: RealtimeTransport {
+    private var continuation: CheckedContinuation<Data, any Error>?
+    private(set) var wasClosed = false
+    var waiting: Bool { continuation != nil }
+    func open() async throws {}
+    func send(_ data: Data) async throws {}
+    func receive() async throws -> Data {
+        try await withCheckedThrowingContinuation { continuation = $0 }
+    }
+    func close() async {
+        wasClosed = true
+        let pending = continuation; continuation = nil
+        pending?.resume(throwing: IoTError.cancelled)
     }
 }

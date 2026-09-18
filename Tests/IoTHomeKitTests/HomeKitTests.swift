@@ -12,12 +12,10 @@ import IoTCore
         #expect(p.displayName == "HomeKit")
     }
 
-    @Test func capabilitiesExposeControlReadScheduleWithoutTouchingHomeKit() async throws {
-        let caps = try await HomeKitProvider().capabilities(for: "acc-uuid")
-        #expect(caps.control != nil)
-        #expect(caps.readState != nil)
-        #expect(caps.schedule != nil)      // HMTimerTrigger scheduling — the crown jewel
-        #expect(caps.subscribe == nil)     // HomeKit push not modelled here
+    @Test func invalidDeviceCannotAdvertiseCapabilitiesWithoutTouchingHomeKit() async throws {
+        await #expect(throws: IoTError.notConfigured) {
+            try await HomeKitProvider().capabilities(for: "acc-uuid")
+        }
     }
 
     @Test func stateMapping() {

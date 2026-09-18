@@ -294,9 +294,16 @@ public struct AdaptiveLatencyProber: EndpointProber {
     public var healthPath: String
     public var headers: [String: String]
 
+    private let sessionConfiguration: URLSessionConfiguration?
+
     public init(healthPath: String, headers: [String: String] = [:]) {
+        self.init(healthPath: healthPath, headers: headers, sessionConfiguration: nil)
+    }
+
+    init(healthPath: String, headers: [String: String], sessionConfiguration: URLSessionConfiguration?) {
         self.healthPath = healthPath
         self.headers = headers
+        self.sessionConfiguration = sessionConfiguration
     }
 
     /// A probe measures transport reachability, not whether the caller's
@@ -336,17 +343,25 @@ public struct AdaptiveLatencyProber: EndpointProber {
     public func probe(_ endpoint: IoTEndpoint) async -> Double? {
         let url = endpoint.url.appendingPathComponent(healthPath)
         let start = Date()
+        let scheme = url.scheme?.lowercased()
         #if canImport(Network)
-        if url.scheme == "http" || url.scheme == "ws" {
+        if scheme == "http" || scheme == "ws" {
             return await rawTCPHead(url) ? Date().timeIntervalSince(start) : nil
         }
         #endif
+        // Only TLS reaches URLSession: any cleartext scheme spelling must go through the policy gate above.
+        guard scheme == "https" || scheme == "wss" else { return nil }
         var request = URLRequest(url: url)
         request.httpMethod = "HEAD"
         request.timeoutInterval = Self.adaptiveTimeout(for: url)
         for (name, value) in headers { request.setValue(value, forHTTPHeaderField: name) }
         do {
-            let (_, response) = try await URLSession.shared.data(for: request)
+            // Never follow redirects: a 3xx already proves reachability, and following one would forward
+            // non-Authorization credential headers (Cookie, CF-Access…) to another origin.
+            let session = URLSession(configuration: sessionConfiguration ?? .ephemeral,
+                                     delegate: ProbeRedirectRefusal(), delegateQueue: nil)
+            defer { session.finishTasksAndInvalidate() }
+            let (_, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse,
                   Self.isReachableHTTPStatus(http.statusCode) else { return nil }
             return Date().timeIntervalSince(start)
@@ -356,19 +371,43 @@ public struct AdaptiveLatencyProber: EndpointProber {
     }
 
     #if canImport(Network)
-    private func rawTCPHead(_ url: URL) async -> Bool {
-        guard let host = url.host(), !host.isEmpty else { return false }
-        let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? 80)) ?? .http
-        let connection = NWConnection(host: .init(host), port: port, using: .tcp)
-        defer { connection.cancel() }
-
-        var lines = "HEAD \(url.path.isEmpty ? "/" : url.path) HTTP/1.1\r\n"
-        lines += "Host: \(host)\r\nConnection: close\r\n"
+    /// The raw cleartext HEAD, or nil when credential headers may not travel to this host or any
+    /// component could inject request lines.
+    static func headRequest(for url: URL, headers: [String: String]) -> String? {
+        guard let host = url.host(percentEncoded: false), !host.isEmpty,
+              !HTTPOrigin.carriesCredentials(headers) || HTTPOrigin.isPrivateHost(host),
+              let components = URLComponents(url: url, resolvingAgainstBaseURL: true) else { return nil }
+        // Keep the path encoded on the wire; a decoded path could break the request line.
+        let path = components.percentEncodedPath.isEmpty ? "/" : components.percentEncodedPath
+        let bracketed = host.contains(":") ? "[\(host)]" : host
+        let authority = url.port.map { "\(bracketed):\($0)" } ?? bracketed
+        func unsafe(_ text: String) -> Bool {
+            text.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+        }
+        guard !unsafe(host), !unsafe(path), !path.contains(" "),
+              headers.allSatisfy({ WebSocketHandshake.isToken($0.key) && !unsafe($0.value) }) else { return nil }
+        var lines = "HEAD \(path) HTTP/1.1\r\n"
+        lines += "Host: \(authority)\r\nConnection: close\r\n"
         let reserved: Set<String> = ["host", "connection"]
         for (name, value) in headers where !reserved.contains(name.lowercased()) {
             lines += "\(name): \(value)\r\n"
         }
         lines += "\r\n"
+        return lines
+    }
+
+    /// The same decoded host `headRequest` checked, as a connector address (a scoped IPv6 keeps its zone).
+    static func connectHost(for url: URL) -> NWEndpoint.Host? {
+        guard let host = url.host(percentEncoded: false), !host.isEmpty else { return nil }
+        return .init(host)
+    }
+
+    private func rawTCPHead(_ url: URL) async -> Bool {
+        guard let lines = Self.headRequest(for: url, headers: headers), let host = Self.connectHost(for: url),
+              let rawPort = UInt16(exactly: url.port ?? 80), rawPort > 0,
+              let port = NWEndpoint.Port(rawValue: rawPort) else { return false }
+        let connection = NWConnection(host: host, port: port, using: .tcp)
+        defer { connection.cancel() }
 
         do {
             try await NWConnectionAsync.waitReady(connection, timeout: Self.adaptiveTimeout(for: url))
@@ -384,4 +423,11 @@ public struct AdaptiveLatencyProber: EndpointProber {
         }
     }
     #endif
+}
+
+private final class ProbeRedirectRefusal: NSObject, URLSessionTaskDelegate, Sendable {
+    func urlSession(_ session: URLSession, task: URLSessionTask, willPerformHTTPRedirection response: HTTPURLResponse,
+                    newRequest request: URLRequest, completionHandler: @escaping (URLRequest?) -> Void) {
+        completionHandler(nil)
+    }
 }

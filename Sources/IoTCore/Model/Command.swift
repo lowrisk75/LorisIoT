@@ -13,6 +13,11 @@ public struct UnitInterval: Codable, Hashable, Sendable, Comparable {
         self.value = value
     }
     public static func < (l: UnitInterval, r: UnitInterval) -> Bool { l.value < r.value }
+    private enum CodingKeys: String, CodingKey { case value }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(container.decode(Double.self, forKey: .value))
+    }
     public var percent: Int { Int((value * 100).rounded()) }
 }
 
@@ -65,7 +70,10 @@ public struct SetLevelCommand: DeviceCommand {
 public enum CommandOutcome: String, Codable, Hashable, Sendable {
     case accepted    // provider took it, not yet confirmed applied
     case applied     // confirmed by re-read
-    case rejected    // provider refused
+    /// The provider refused, or the requested state was not observed on the immediate readback. In the
+    /// second case the command may still have executed (a slow integration or transition): never treat
+    /// `.rejected` as proof of non-execution or replay it automatically.
+    case rejected
     case uncertain   // transport failed after the send may have happened
 }
 
@@ -105,9 +113,16 @@ public struct DeviceSchedule: Codable, Hashable, Sendable, Identifiable {
     public let start: Date
     public let recurrence: ScheduleRecurrence
     public let isEnabled: Bool
+    public let timeZoneIdentifier: String?
+    /// Seconds the device itself takes to reach the commanded level. A luminaire owns its ramp
+    /// (Zigbee/Matter Level Control transition time), so a sunrise is one intent, never a step
+    /// sequence driven by the app or the server. Nil means apply the command at once.
+    public let transition: TimeInterval?
     public init(id: ScheduleID, deviceID: DeviceID, command: CommandPayload, start: Date,
-                recurrence: ScheduleRecurrence, isEnabled: Bool) {
+                recurrence: ScheduleRecurrence, isEnabled: Bool, timeZoneIdentifier: String? = nil,
+                transition: TimeInterval? = nil) {
         self.id = id; self.deviceID = deviceID; self.command = command; self.start = start
         self.recurrence = recurrence; self.isEnabled = isEnabled
+        self.timeZoneIdentifier = timeZoneIdentifier; self.transition = transition
     }
 }

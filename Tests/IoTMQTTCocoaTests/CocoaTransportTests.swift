@@ -131,10 +131,11 @@ private let dummy = {
 @Suite struct CocoaMQTTLiveBrokerTests {
 
     static var brokerHost: String? { ProcessInfo.processInfo.environment["LORISIOT_MQTT_BROKER"] }
+    static var brokerPort: UInt16 { UInt16(ProcessInfo.processInfo.environment["LORISIOT_MQTT_PORT"] ?? "1883") ?? 1883 }
 
     @Test(.enabled(if: brokerHost != nil))
     func liveConnectSubscribePublishReceive() async throws {
-        let config = MQTTBrokerConfig(host: Self.brokerHost!, clientID: "lorisiot-test-\(UUID().uuidString.prefix(8))")
+        let config = MQTTBrokerConfig(host: Self.brokerHost!, port: Self.brokerPort, clientID: "lorisiot-test-\(UUID().uuidString.prefix(8))")
         let transport = CocoaMQTTTransport(config: config)
         try await transport.connect()
         let stream = await transport.messages()
@@ -158,13 +159,13 @@ private let dummy = {
     func liveRetainedMessageGivesLastKnownState() async throws {
         let topic = "lorisiot/test/retained-\(UUID().uuidString.prefix(8))"
         // Writer publishes retained, then a LATER subscriber must still receive it.
-        let writer = CocoaMQTTTransport(config: .init(host: Self.brokerHost!, clientID: "lorisiot-w-\(UUID().uuidString.prefix(8))"))
+        let writer = CocoaMQTTTransport(config: .init(host: Self.brokerHost!, port: Self.brokerPort, clientID: "lorisiot-w-\(UUID().uuidString.prefix(8))"))
         try await writer.connect()
         try await writer.publish(topic: topic, payload: Data("OFF".utf8), qos: .atLeastOnce, retain: true)
         try await Task.sleep(for: .milliseconds(300))
         await writer.disconnect()
 
-        let reader = CocoaMQTTTransport(config: .init(host: Self.brokerHost!, clientID: "lorisiot-r-\(UUID().uuidString.prefix(8))"))
+        let reader = CocoaMQTTTransport(config: .init(host: Self.brokerHost!, port: Self.brokerPort, clientID: "lorisiot-r-\(UUID().uuidString.prefix(8))"))
         try await reader.connect()
         let stream = await reader.messages()
         try await reader.subscribe(topic: topic)

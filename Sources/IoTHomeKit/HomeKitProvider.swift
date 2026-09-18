@@ -1,187 +1,97 @@
 import Foundation
 import IoTCore
-#if canImport(HomeKit)
-import HomeKit
-#endif
 
-/// HomeKit provider. Its unique value is **`HMTimerTrigger` scheduling** — a timed action that fires
-/// on the home hub (HomePod/Apple TV) with the iPhone off/suspended: the Apple-native equivalent of
-/// Shelly's on-device schedule (the pre-provisioning law). Control/read go through
-/// `HMCharacteristic`. Ported from Velya `HomeKitWakeTrigger`.
-///
-/// Device-gated: HomeKit isn't available in the Simulator and needs the HomeKit entitlement +
-/// permission; every path no-ops gracefully without a home. `NSHomeKitUsageDescription` is the host
-/// app's responsibility.
+/// HomeKit objects stay on the main actor behind a Sendable bridge. Scheduling requires an explicit
+/// installation owner and durable journal; provisioning does not prove that a physical hub will fire.
 public actor HomeKitProvider: DeviceProvider {
-    public nonisolated let id: ProviderID = "homekit"
+    public nonisolated let id: ProviderID
     public nonisolated let displayName = "HomeKit"
+    private let transport: any HomeKitDeviceTransport
+    private let owner: ScheduleOwner?
+    private let store: (any ScheduleStore)?
+    private let events: ConnectionEventHub
     private let seq = SequenceGen()
+    private var scheduleHandles: [DeviceID: HomeKitOwnedSchedules] = [:]
 
-    #if canImport(HomeKit)
-    private var manager: HMHomeManager?
-    #endif
-
-    public init() {}
-
+    public init(homeID: UUID? = nil, owner: ScheduleOwner? = nil, store: (any ScheduleStore)? = nil,
+                id: ProviderID = "homekit") {
+        self.id = id; self.owner = owner; self.store = store
+        self.transport = NativeHomeKitBridge(homeID: homeID)
+        self.events = ConnectionEventHub(providerID: id)
+    }
+    init(transport: any HomeKitDeviceTransport, owner: ScheduleOwner? = nil, store: (any ScheduleStore)? = nil) {
+        self.id = "homekit"; self.transport = transport; self.owner = owner; self.store = store
+        self.events = ConnectionEventHub(providerID: "homekit")
+    }
     public func connect() async throws {
-        #if canImport(HomeKit)
-        _ = await primaryHome()
-        #endif
+        await events.publish(.connecting)
+        do {
+            _ = try await transport.devices()
+            await events.publish(.connected)
+        } catch {
+            await events.publish(.degraded, reason: "HomeKit is unavailable")
+            throw error
+        }
     }
-    public func disconnect() async {}
-
+    public func disconnect() async {
+        await transport.disconnect()
+        await events.publish(.disconnected)
+    }
     public func devices() async throws -> [Device] {
-        #if canImport(HomeKit)
-        guard let home = await primaryHome() else { return [] }
-        return await MainActor.run {
-            home.accessories.compactMap { acc -> Device? in
-                guard powerCharacteristic(in: acc) != nil else { return nil }
-                return Device(id: DeviceID(rawValue: acc.uniqueIdentifier.uuidString), providerID: id,
-                              nativeID: acc.uniqueIdentifier.uuidString, name: acc.name,
-                              kind: isLight(acc) ? .light : .switchDevice,
-                              capabilities: [.control, .readState, .schedule].map { CapabilityDescriptor(id: $0, operations: []) })
-            }
+        try await transport.devices().map {
+            Device(id: $0.id, providerID: id, nativeID: $0.id.rawValue, name: $0.name, kind: $0.kind,
+                   capabilities: descriptors($0))
         }
-        #else
-        return []
-        #endif
     }
-
+    private func descriptors(_ device: HomeKitDeviceDescription) -> [CapabilityDescriptor] {
+        var result: [CapabilityDescriptor] = []
+        if device.readable { result.append(.init(id: .readState, operations: [.readState])) }
+        if device.writable { result.append(.init(id: .control, operations: [.control])) }
+        if device.supportsTimers, device.writable, owner != nil, store != nil {
+            result.append(.init(id: .schedule, operations: [.schedule]))
+        }
+        return result
+    }
     public func capabilities(for deviceID: DeviceID) async throws -> DeviceCapabilitySet {
-        DeviceCapabilitySet(
-            descriptors: [.readState, .control, .schedule].map { CapabilityDescriptor(id: $0, operations: []) },
-            control: HomeKitControlCapability(provider: self, deviceID: deviceID, seq: seq),
-            readState: HomeKitReadStateCapability(provider: self, deviceID: deviceID, seq: seq),
-            schedule: HomeKitScheduleCapability(provider: self, deviceID: deviceID))
-    }
-
-    public func connectionEvents() async -> AsyncStream<ProviderConnectionEvent> {
-        let id = self.id
-        return AsyncStream { c in c.yield(ProviderConnectionEvent(providerID: id, state: .connected)); c.finish() }
-    }
-
-    // MARK: - Capability-facing API (unconditional; no-ops without HomeKit)
-
-    func setPower(_ deviceID: DeviceID, on: Bool) async -> Bool {
-        #if canImport(HomeKit)
-        guard let (_, ch) = await accessoryAndPower(deviceID) else { return false }
-        return await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
-            ch.writeValue(NSNumber(value: on)) { error in c.resume(returning: error == nil) }
+        guard UUID(uuidString: deviceID.rawValue) != nil,
+              let device = try await transport.devices().first(where: { $0.id == deviceID }) else {
+            throw IoTError.notConfigured
         }
-        #else
-        return false
-        #endif
-    }
-
-    func readPower(_ deviceID: DeviceID) async -> Bool? {
-        #if canImport(HomeKit)
-        guard let (_, ch) = await accessoryAndPower(deviceID) else { return nil }
-        return await withCheckedContinuation { (c: CheckedContinuation<Bool?, Never>) in
-            ch.readValue { _ in c.resume(returning: (ch.value as? Bool) ?? (ch.value as? NSNumber)?.boolValue) }
+        if device.supportsTimers, device.writable, let owner, let store, scheduleHandles[deviceID] == nil {
+            scheduleHandles[deviceID] = HomeKitOwnedSchedules(transport: transport, deviceID: deviceID,
+                owner: owner, store: store, providerID: id)
         }
-        #else
-        return nil
-        #endif
+        return DeviceCapabilitySet(descriptors: descriptors(device),
+            control: device.writable ? HomeKitControlCapability(provider: self, deviceID: deviceID, seq: seq) : nil,
+            readState: device.readable ? HomeKitReadStateCapability(provider: self, deviceID: deviceID, seq: seq) : nil,
+            schedule: scheduleHandles[deviceID])
     }
-
-    func provisionTimer(_ deviceID: DeviceID, on: Bool, fireDate: Date) async -> String? {
-        #if canImport(HomeKit)
-        return await provisionTimerHK(deviceID, on: on, fireDate: fireDate)
-        #else
-        return nil
-        #endif
-    }
-
-    func clearTimer(named name: String) async {
-        #if canImport(HomeKit)
-        guard let home = await primaryHome() else { return }
-        await removeExisting(named: name, in: home)
-        #endif
-    }
-
-    // MARK: - HomeKit bridging (internal)
-
-    #if canImport(HomeKit)
-    private func primaryHome() async -> HMHome? {
-        let m = await ensureManager()
-        // HMHomeManager populates asynchronously; poll briefly.
-        for _ in 0..<15 {
-            if let home = await MainActor.run(body: { m.homes.first }) { return home }
-            try? await Task.sleep(for: .milliseconds(200))
-        }
-        return nil
-    }
-
-    private func ensureManager() async -> HMHomeManager {
-        if let manager { return manager }
-        let m = await MainActor.run { HMHomeManager() }
-        manager = m
-        return m
-    }
-
-    private func accessoryAndPower(_ deviceID: DeviceID) async -> (HMAccessory, HMCharacteristic)? {
-        guard let home = await primaryHome(), let uuid = UUID(uuidString: deviceID.rawValue) else { return nil }
-        return await MainActor.run {
-            guard let acc = home.accessories.first(where: { $0.uniqueIdentifier == uuid }),
-                  let ch = powerCharacteristic(in: acc) else { return nil }
-            return (acc, ch)
+    public func connectionEvents() async -> AsyncStream<ProviderConnectionEvent> { await events.events() }
+    func setPower(_ deviceID: DeviceID, on: Bool) async throws { try await transport.setPower(deviceID, on: on) }
+    func readPower(_ deviceID: DeviceID) async throws -> Bool {
+        do { return try await transport.readPower(deviceID) }
+        catch {
+            await events.publish(.degraded, reason: "The accessory state could not be read")
+            throw error
         }
     }
-
-    /// Provision an `HMTimerTrigger` + `HMActionSet` that sets the accessory power at `fireDate` on the
-    /// home hub — fires with the app dead. Replaces any prior LorisIoT-owned trigger/action-set.
-    private func provisionTimerHK(_ deviceID: DeviceID, on: Bool, fireDate: Date) async -> String? {
-        guard let home = await primaryHome(), let (_, ch) = await accessoryAndPower(deviceID) else { return nil }
-        let setName = "LorisIoT \(deviceID.rawValue)"
-        await removeExisting(named: setName, in: home)
-        guard let set = try? await addActionSet(named: setName, in: home) else { return nil }
-        let action = HMCharacteristicWriteAction(characteristic: ch, targetValue: NSNumber(value: on))
-        _ = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
-            set.addAction(action) { c.resume(returning: $0 == nil) }
-        }
-        let rounded = Calendar.current.date(bySetting: .second, value: 0, of: fireDate) ?? fireDate
-        let trigger = HMTimerTrigger(name: setName, fireDate: rounded, timeZone: nil, recurrence: nil, recurrenceCalendar: nil)
-        let added = await withCheckedContinuation { (c: CheckedContinuation<Bool, Never>) in
-            home.addTrigger(trigger) { c.resume(returning: $0 == nil) }
-        }
-        guard added else { return nil }
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in trigger.addActionSet(set) { _ in c.resume() } }
-        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in trigger.enable(true) { _ in c.resume() } }
-        return setName
-    }
-
-    private func removeExisting(named name: String, in home: HMHome) async {
-        for t in home.triggers where t.name == name {
-            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in home.removeTrigger(t) { _ in c.resume() } }
-        }
-        for s in home.actionSets where s.name == name {
-            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in home.removeActionSet(s) { _ in c.resume() } }
-        }
-    }
-
-    private func addActionSet(named name: String, in home: HMHome) async throws -> HMActionSet {
-        try await withCheckedThrowingContinuation { (c: CheckedContinuation<HMActionSet, Error>) in
-            home.addActionSet(withName: name) { set, err in
-                if let set { c.resume(returning: set) } else { c.resume(throwing: err ?? IoTError.invalidResponse) }
-            }
-        }
-    }
-    #endif
 }
 
-#if canImport(HomeKit)
-@MainActor func powerCharacteristic(in accessory: HMAccessory) -> HMCharacteristic? {
-    for service in accessory.services {
-        for ch in service.characteristics where ch.characteristicType == HMCharacteristicTypePowerState { return ch }
-    }
-    return nil
+struct HomeKitDeviceDescription: Sendable {
+    let id: DeviceID
+    let name: String
+    let kind: DeviceKind
+    let readable: Bool
+    let writable: Bool
+    let supportsTimers: Bool
 }
-@MainActor func isLight(_ accessory: HMAccessory) -> Bool {
-    accessory.services.contains { $0.serviceType == HMServiceTypeLightbulb }
-}
-#endif
 
-// MARK: - Capabilities
+protocol HomeKitDeviceTransport: HomeKitTimerTransport {
+    func devices() async throws -> [HomeKitDeviceDescription]
+    func readPower(_ deviceID: DeviceID) async throws -> Bool
+    func setPower(_ deviceID: DeviceID, on: Bool) async throws
+    func disconnect() async
+}
 
 func homeKitState(_ on: Bool?, id: DeviceID, seq: UInt64) -> DeviceState {
     DeviceState(deviceID: id, availability: on == nil ? .offline : .online,
@@ -190,51 +100,37 @@ func homeKitState(_ on: Bool?, id: DeviceID, seq: UInt64) -> DeviceState {
 }
 
 actor HomeKitControlCapability: ControlCapability {
-    public nonisolated let descriptor = CapabilityDescriptor(id: .control, operations: [.control])
-    private let provider: HomeKitProvider; private let deviceID: DeviceID; private let seq: SequenceGen
-    init(provider: HomeKitProvider, deviceID: DeviceID, seq: SequenceGen) { self.provider = provider; self.deviceID = deviceID; self.seq = seq }
+    nonisolated let descriptor = CapabilityDescriptor(id: .control, operations: [.control])
+    private let provider: HomeKitProvider
+    private let deviceID: DeviceID
+    private let seq: SequenceGen
+    init(provider: HomeKitProvider, deviceID: DeviceID, seq: SequenceGen) {
+        self.provider = provider; self.deviceID = deviceID; self.seq = seq
+    }
     func execute<C: DeviceCommand>(_ command: C) async throws -> CommandReceipt {
-        guard case .setPower(let on) = command.payload else { throw IoTError.notSupported("HomeKit control supports power") }
-        func receipt(_ o: CommandOutcome, _ s: DeviceState?) -> CommandReceipt {
-            CommandReceipt(commandID: command.id, deviceID: deviceID, outcome: o, state: s)
+        guard command.deviceID == deviceID else { throw IoTError.notConfigured }
+        guard case .setPower(let on) = command.payload else { throw IoTError.notSupported("HomeKit power commands only") }
+        func receipt(_ outcome: CommandOutcome, _ state: DeviceState? = nil) -> CommandReceipt {
+            CommandReceipt(commandID: command.id, deviceID: deviceID, outcome: outcome, state: state)
         }
-        guard await provider.setPower(deviceID, on: on) else { return receipt(.uncertain, nil) }
-        let now = await provider.readPower(deviceID)
-        if now == nil { return receipt(.accepted, nil) }
-        return receipt(now == on ? .applied : .rejected, homeKitState(now, id: deviceID, seq: await seq.next()))
+        try Task.checkCancellation()
+        do { try await provider.setPower(deviceID, on: on) }
+        catch { return receipt(.uncertain) }
+        guard let observed = try? await provider.readPower(deviceID) else { return receipt(.accepted) }
+        return receipt(observed == on ? .applied : .rejected,
+                       homeKitState(observed, id: deviceID, seq: await seq.next()))
     }
 }
 
 actor HomeKitReadStateCapability: ReadStateCapability {
-    public nonisolated let descriptor = CapabilityDescriptor(id: .readState, operations: [.readState])
-    private let provider: HomeKitProvider; private let deviceID: DeviceID; private let seq: SequenceGen
-    init(provider: HomeKitProvider, deviceID: DeviceID, seq: SequenceGen) { self.provider = provider; self.deviceID = deviceID; self.seq = seq }
+    nonisolated let descriptor = CapabilityDescriptor(id: .readState, operations: [.readState])
+    private let provider: HomeKitProvider
+    private let deviceID: DeviceID
+    private let seq: SequenceGen
+    init(provider: HomeKitProvider, deviceID: DeviceID, seq: SequenceGen) {
+        self.provider = provider; self.deviceID = deviceID; self.seq = seq
+    }
     func state() async throws -> DeviceState {
-        homeKitState(await provider.readPower(deviceID), id: deviceID, seq: await seq.next())
-    }
-}
-
-/// `.schedule` via `HMTimerTrigger` — fires on the home hub with the app dead.
-actor HomeKitScheduleCapability: ScheduleCapability {
-    public nonisolated let descriptor = CapabilityDescriptor(id: .schedule, operations: [.schedule])
-    private let provider: HomeKitProvider; private let deviceID: DeviceID
-    private var handle: String?
-    init(provider: HomeKitProvider, deviceID: DeviceID) { self.provider = provider; self.deviceID = deviceID }
-
-    func schedules() async throws -> [DeviceSchedule] { [] }
-    func upsert(_ schedule: DeviceSchedule) async throws -> DeviceSchedule {
-        let on: Bool = { if case .setPower(let v) = schedule.command { return v }; return true }()
-        #if canImport(HomeKit)
-        handle = await provider.provisionTimer(deviceID, on: on, fireDate: schedule.start)
-        guard handle != nil else { throw IoTError.notSupported("HomeKit trigger provisioning failed (no hub?)") }
-        return schedule
-        #else
-        throw IoTError.notSupported("HomeKit unavailable on this platform")
-        #endif
-    }
-    func removeSchedule(id: ScheduleID) async throws {
-        #if canImport(HomeKit)
-        if let handle { await provider.clearTimer(named: handle); self.handle = nil }
-        #endif
+        homeKitState(try await provider.readPower(deviceID), id: deviceID, seq: await seq.next())
     }
 }

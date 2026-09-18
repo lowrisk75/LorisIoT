@@ -1,0 +1,2 @@
+# Isolated test environment only; not a custom-component runtime dependency.
+homeassistant==2026.9.1

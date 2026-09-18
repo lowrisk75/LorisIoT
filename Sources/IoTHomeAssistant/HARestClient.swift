@@ -18,9 +18,14 @@ public actor HARestClient {
 
     /// One entity's current state.
     public func state(entityID: String) async throws -> HAEntityState {
+        guard Self.isEntityID(entityID) else { throw IoTError.notConfigured }
         let (data, status) = try await http.send(method: "GET", path: "api/states/\(entityID)", body: nil)
         try Self.check(status)
-        do { return try JSONDecoder().decode(HAEntityState.self, from: data) }
+        do {
+            let state = try JSONDecoder().decode(HAEntityState.self, from: data)
+            guard state.entityID == entityID else { throw IoTError.invalidResponse }
+            return state
+        }
         catch { throw IoTError.invalidResponse }
     }
 
@@ -36,6 +41,10 @@ public actor HARestClient {
     /// transition: 2.5}` — arbitrary JSON-encodable service data.
     public func callService(domain: String, service: String, entityID: String,
                             data: [String: any Sendable] = [:]) async throws {
+        guard Self.isIdentifier(domain), Self.isIdentifier(service), Self.isEntityID(entityID),
+              Set(data.keys).isDisjoint(with: ["entity_id", "device_id", "area_id", "floor_id", "label_id", "target"]) else {
+            throw IoTError.notConfigured
+        }
         var body: [String: Any] = ["entity_id": entityID]
         for (k, v) in data { body[k] = v }
         let payload = try JSONSerialization.data(withJSONObject: body)
@@ -49,6 +58,7 @@ public actor HARestClient {
     /// way and a server automation reacts to it).
     public func setState(entityID: String, state: String,
                          attributes: [String: any Sendable] = [:]) async throws {
+        guard Self.isEntityID(entityID) else { throw IoTError.notConfigured }
         let body: [String: Any] = ["state": state, "attributes": attributes]
         let payload = try JSONSerialization.data(withJSONObject: body)
         let (_, status) = try await http.send(method: "POST",
@@ -59,6 +69,7 @@ public actor HARestClient {
     /// Raw body of `GET /api/states/<id>` — for apps whose domain needs more of the attribute bag
     /// than `HAEntityState` models (rule engines…). Auth/status mapping still applies.
     public func stateData(entityID: String) async throws -> Data {
+        guard Self.isEntityID(entityID) else { throw IoTError.notConfigured }
         let (data, status) = try await http.send(method: "GET", path: "api/states/\(entityID)", body: nil)
         try Self.check(status)
         return data
@@ -73,10 +84,20 @@ public actor HARestClient {
 
     /// Set an `input_datetime` helper — the server-side pre-provisioning primitive for scheduled wakes.
     public func setInputDatetime(entityID: String, isoDate: String) async throws {
+        guard Self.isEntityID(entityID), entityID.hasPrefix("input_datetime.") else { throw IoTError.notConfigured }
         let body = try JSONSerialization.data(withJSONObject: ["entity_id": entityID, "datetime": isoDate])
         let (_, status) = try await http.send(method: "POST",
                                               path: "api/services/input_datetime/set_datetime", body: body)
         try Self.check(status)
+    }
+
+    nonisolated static func isEntityID(_ value: String) -> Bool {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        return value.utf8.count <= 255 && parts.count == 2 && parts.allSatisfy { isIdentifier(String($0)) }
+    }
+
+    private nonisolated static func isIdentifier(_ value: String) -> Bool {
+        !value.isEmpty && value.utf8.allSatisfy { (97...122).contains($0) || (48...57).contains($0) || $0 == 95 }
     }
 
     private static func check(_ status: Int) throws {

@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 #if canImport(Network)
 import Network
 #endif
@@ -23,6 +24,7 @@ enum WebSocketHandshake {
     /// Headers the transport owns; caller-supplied extras with these names are dropped.
     static let reservedHeaders: Set<String> = [
         "host", "upgrade", "connection", "sec-websocket-key", "sec-websocket-version",
+        "content-length", "transfer-encoding", "sec-websocket-extensions",
     ]
 
     static func randomKey() -> String {
@@ -33,8 +35,21 @@ enum WebSocketHandshake {
 
     /// Build the HTTP/1.1 upgrade request. `extraHeaders` carries auth (Basic, Cookie,
     /// CF-Access service tokens, forward-auth) — reserved names are filtered out.
+    private static let tokens = CharacterSet(charactersIn: "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!#$%&'*+-.^_`|~")
+    /// RFC 9110 token: the only safe shape for a header name.
+    static func isToken(_ name: String) -> Bool { !name.isEmpty && name.unicodeScalars.allSatisfy { tokens.contains($0) } }
+
     static func upgradeRequest(host: String, path: String, key: String,
-                               extraHeaders: [String: String] = [:]) -> Data {
+                               extraHeaders: [String: String] = [:]) throws -> Data {
+        guard !host.isEmpty, !host.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }),
+              path.isEmpty || path.hasPrefix("/"),
+              !path.unicodeScalars.contains(where: { CharacterSet.whitespacesAndNewlines.contains($0) || CharacterSet.controlCharacters.contains($0) }),
+              !key.contains("\r"), !key.contains("\n"), extraHeaders.count <= 64,
+              Set(extraHeaders.keys.map { $0.lowercased() }).count == extraHeaders.count,
+              extraHeaders.allSatisfy({ name, value in
+                  isToken(name)
+                  && !value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
+              }) else { throw IoTError.notConfigured }
         var lines = "GET \(path.isEmpty ? "/" : path) HTTP/1.1\r\n"
         lines += "Host: \(host)\r\n"
         lines += "Upgrade: websocket\r\n"
@@ -46,23 +61,52 @@ enum WebSocketHandshake {
             lines += "\(name): \(value)\r\n"
         }
         lines += "\r\n"
+        guard lines.utf8.count <= 8192 else { throw IoTError.notConfigured }
         return Data(lines.utf8)
     }
 
     /// Parse the raw response header block. Detects Caddy/nginx/Traefik auto-HTTPS 30x redirects
     /// so an `http://`-configured server doesn't perma-fail the live channel (Lumen 2026-05-22).
-    static func parseUpgradeResponse(_ data: Data) -> WebSocketUpgradeResult {
-        guard let text = String(data: data, encoding: .utf8) else {
-            return .rejected(statusLine: "<binary>")
+    static func parseUpgradeResponse(_ data: Data, expectedKey: String? = nil,
+                                     requestedProtocols: [String] = []) -> WebSocketUpgradeResult {
+        guard data.count <= 8192, let text = String(data: data, encoding: .utf8),
+              text.hasSuffix("\r\n\r\n") else { return .rejected(statusLine: "<invalid header>") }
+        let lines = text.components(separatedBy: "\r\n")
+        guard let statusLine = lines.first else { return .rejected(statusLine: "<missing status>") }
+        let status = statusLine.split(separator: " ", omittingEmptySubsequences: true)
+        guard status.count >= 2, status[0] == "HTTP/1.1", status[1].count == 3,
+              let code = Int(status[1]) else { return .rejected(statusLine: "<invalid status>") }
+        var headers: [String: [String]] = [:]
+        for line in lines.dropFirst() where !line.isEmpty {
+            guard let colon = line.firstIndex(of: ":"), line.first != " ", line.first != "\t" else {
+                return .rejected(statusLine: "<invalid header>")
+            }
+            let name = String(line[..<colon]).lowercased()
+            let value = line[line.index(after: colon)...].trimmingCharacters(in: .whitespaces)
+            headers[name, default: []].append(value)
         }
-        let statusLine = text.split(separator: "\r\n", maxSplits: 1,
-                                    omittingEmptySubsequences: false).first.map(String.init) ?? text
-        if statusLine.contains(" 101") { return .accepted }
-        let isRedirect = [" 301", " 302", " 307", " 308"].contains { statusLine.contains($0) }
-        if isRedirect, let location = httpsLocation(in: text) {
-            return .redirectToHTTPS(location)
+        if code == 101 {
+            guard let expectedKey,
+                  headers["upgrade"]?.map({ $0.lowercased() }) == ["websocket"],
+                  headers["connection"]?.joined(separator: ",").split(separator: ",")
+                    .contains(where: { $0.trimmingCharacters(in: .whitespaces).lowercased() == "upgrade" }) == true,
+                  headers["sec-websocket-accept"] == [acceptValue(for: expectedKey)],
+                  headers["sec-websocket-extensions"] == nil else { return .rejected(statusLine: "<invalid upgrade proof>") }
+            if let protocols = headers["sec-websocket-protocol"] {
+                guard protocols.count == 1, requestedProtocols.contains(protocols[0]) else {
+                    return .rejected(statusLine: "<unexpected subprotocol>")
+                }
+            } else if !requestedProtocols.isEmpty { return .rejected(statusLine: "<missing subprotocol>") }
+            return .accepted
         }
+        if [301, 302, 307, 308].contains(code), headers["location"]?.count == 1,
+           let location = httpsLocation(in: text) { return .redirectToHTTPS(location) }
         return .rejected(statusLine: String(statusLine.prefix(200)))
+    }
+
+    static func acceptValue(for key: String) -> String {
+        // SHA-1 here is the mandated RFC 6455 nonce response, never credential hashing.
+        Data(Insecure.SHA1.hash(data: Data((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").utf8))).base64EncodedString()
     }
 
     /// Case-insensitive `Location:` lookup; only absolute `https://` targets count.
@@ -86,6 +130,7 @@ struct WebSocketFrame: Equatable, Sendable {
     }
     var opcode: Opcode
     var payload: Data
+    var isFinal = true
 }
 
 enum WebSocketFrameCodec {
@@ -121,6 +166,8 @@ enum WebSocketFrameCodec {
 /// frames with `nextFrame()` — chunk boundaries never have to align with frame boundaries.
 struct WebSocketFrameDecoder: Sendable {
     private var buffer = Data()
+    private let acceptsMaskedFrames: Bool
+    init(acceptsMaskedFrames: Bool = false) { self.acceptsMaskedFrames = acceptsMaskedFrames }
 
     mutating func append(_ data: Data) { buffer.append(data) }
 
@@ -133,20 +180,27 @@ struct WebSocketFrameDecoder: Sendable {
             throw IoTError.transport("unsupported WebSocket opcode 0x\(String(b[0] & 0x0F, radix: 16))")
         }
         let isMasked = (b[1] & 0x80) != 0
+        let isFinal = (b[0] & 0x80) != 0
+        guard b[0] & 0x70 == 0, !isMasked || acceptsMaskedFrames else { throw IoTError.invalidResponse }
         var length = UInt64(b[1] & 0x7F)
         var offset = 2
         if length == 126 {
             guard b.count >= 4 else { return nil }
             length = UInt64(b[2]) << 8 | UInt64(b[3])
             offset = 4
+            guard length >= 126 else { throw IoTError.invalidResponse }
         } else if length == 127 {
             guard b.count >= 10 else { return nil }
             length = 0
             for i in 0..<8 { length = length << 8 | UInt64(b[2 + i]) }
             offset = 10
+            guard length > 65535, b[2] & 0x80 == 0 else { throw IoTError.invalidResponse }
         }
         guard length <= UInt64(WebSocketFrameCodec.maxPayloadBytes) else {
             throw IoTError.transport("WebSocket frame exceeds \(WebSocketFrameCodec.maxPayloadBytes)B cap")
+        }
+        if opcode.rawValue & 0x08 != 0 {
+            guard isFinal, length <= 125 else { throw IoTError.invalidResponse }
         }
         var maskKey: [UInt8]?
         if isMasked {
@@ -161,7 +215,7 @@ struct WebSocketFrameDecoder: Sendable {
         if let maskKey {
             for i in payload.indices { payload[i] ^= maskKey[(i - payload.startIndex) % 4] }
         }
-        return WebSocketFrame(opcode: opcode, payload: payload)
+        return WebSocketFrame(opcode: opcode, payload: payload, isFinal: isFinal)
     }
 }
 
@@ -183,6 +237,11 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
     private let sendsText: Bool
     private var connection: NWConnection?
     private var decoder = WebSocketFrameDecoder()
+    private var assembler = WebSocketMessageAssembler()
+    private var generation: UInt64 = 0
+    private var isOpen = false
+    private var receivingGeneration: UInt64?
+    private var timedOutGeneration: UInt64?
 
     /// - Parameters:
     ///   - url: `http://` or `ws://` URL including the socket path (e.g. `http://host:5000/ws`).
@@ -198,89 +257,166 @@ public actor RawTCPWebSocketTransport: RealtimeTransport {
         self.sendsText = sendsText
     }
 
+    /// The address the policy checked. URLComponents keeps IPv6 brackets, which `NWEndpoint.Host` would
+    /// otherwise treat as a hostname to resolve.
+    static func endpointHost(_ host: String) -> NWEndpoint.Host {
+        guard host.hasPrefix("["), host.hasSuffix("]") else { return .init(host) }
+        return .init(String(host.dropFirst().dropLast()))
+    }
+
     public func open() async throws {
-        guard let host = url.host(), !host.isEmpty else {
-            throw IoTError.transport("no host in \(url.absoluteString)")
+        guard connection == nil else { throw IoTError.notConfigured }
+        guard let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              ["http", "ws"].contains(components.scheme?.lowercased() ?? ""),
+              components.user == nil, components.password == nil, components.fragment == nil,
+              let host = components.host, !host.isEmpty,
+              let rawPort = UInt16(exactly: components.port ?? 80), rawPort > 0,
+              let port = NWEndpoint.Port(rawValue: rawPort),
+              connectTimeout.isFinite, connectTimeout > 0, connectTimeout <= 60 else {
+            throw IoTError.notConfigured
         }
-        let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? 80)) ?? .http
-        let conn = NWConnection(host: .init(host), port: port, using: .tcp)
+        // No TLS here: credential headers may only travel to a private host.
+        // A query string can carry a token as well as a header can.
+        let mayCarryCredentials = HTTPOrigin.carriesCredentials(extraHeaders) || !(components.percentEncodedQuery ?? "").isEmpty
+        guard !mayCarryCredentials || HTTPOrigin.isPrivateHost(host) else {
+            throw IoTError.notSupported("Credentials over a cleartext WebSocket are only allowed on a private network")
+        }
+        let key = WebSocketHandshake.randomKey()
+        let path = (components.percentEncodedPath.isEmpty ? "/" : components.percentEncodedPath)
+            + (components.percentEncodedQuery.map { "?" + $0 } ?? "")
+        let authority = host + (components.port.map { ":\($0)" } ?? "")
+        let request = try WebSocketHandshake.upgradeRequest(host: authority, path: path, key: key,
+                                                             extraHeaders: extraHeaders)
+        let protocols = extraHeaders.first(where: { $0.key.lowercased() == "sec-websocket-protocol" })?
+            .value.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) } ?? []
+        try Task.checkCancellation()
+        let conn = NWConnection(host: Self.endpointHost(host), port: port, using: .tcp)
+        generation &+= 1
+        let token = generation
         connection = conn
         decoder = WebSocketFrameDecoder()
-
-        try await NWConnectionAsync.waitReady(conn, timeout: connectTimeout)
-
-        let request = WebSocketHandshake.upgradeRequest(
-            host: host, path: url.path, key: WebSocketHandshake.randomKey(),
-            extraHeaders: extraHeaders)
-        try await NWConnectionAsync.send(conn, request)
-
-        let response = try await readUntilHeaderEnd(conn)
-        switch WebSocketHandshake.parseUpgradeResponse(response) {
-        case .accepted:
-            break
-        case .redirectToHTTPS(let location):
-            await close()
-            throw IoTError.redirected(toHTTPS: location)
-        case .rejected(let statusLine):
-            await close()
-            throw IoTError.transport("WebSocket upgrade rejected: \(statusLine)")
+        assembler = WebSocketMessageAssembler()
+        let deadline = Task { [weak self, connectTimeout] in
+            do { try await Task.sleep(for: .seconds(connectTimeout)) } catch { return }
+            await self?.expireOpening(token)
+        }
+        defer { deadline.cancel() }
+        do {
+            try await withTaskCancellationHandler {
+                try await NWConnectionAsync.waitReady(conn, timeout: connectTimeout)
+                try validate(token)
+                try await NWConnectionAsync.send(conn, request)
+                let response = try await readUntilHeaderEnd(conn, generation: token)
+                try validate(token)
+                switch WebSocketHandshake.parseUpgradeResponse(response, expectedKey: key, requestedProtocols: protocols) {
+                case .accepted: isOpen = true
+                case .redirectToHTTPS(let location):
+                    guard let target = URLComponents(string: location), target.scheme?.lowercased() == "https",
+                          target.host?.lowercased() == components.host?.lowercased(),
+                          target.user == nil, target.password == nil, target.fragment == nil,
+                          (1...65535).contains(target.port ?? 443) else { throw IoTError.notConfigured }
+                    throw IoTError.redirected(toHTTPS: location)
+                case .rejected(let statusLine):
+                    throw IoTError.transport("WebSocket upgrade rejected: \(statusLine)")
+                }
+            } onCancel: { conn.cancel() }
+        } catch {
+            if generation == token { await close() }
+            if Task.isCancelled { throw CancellationError() }
+            if timedOutGeneration == token { throw IoTError.timeout }
+            throw error
         }
     }
 
+    private func validate(_ token: UInt64) throws {
+        try Task.checkCancellation()
+        guard generation == token, connection != nil else { throw IoTError.notConnected }
+    }
+
+    private func expireOpening(_ token: UInt64) async {
+        guard generation == token, !isOpen else { return }
+        timedOutGeneration = token
+        await close()
+    }
+
     public func send(_ data: Data) async throws {
-        guard let connection else { throw IoTError.notConnected }
+        guard let connection, isOpen else { throw IoTError.notConnected }
+        guard data.count <= WebSocketMessageAssembler().maxPayloadBytes,
+              !sendsText || String(data: data, encoding: .utf8) != nil else { throw IoTError.invalidResponse }
+        let token = generation
         let frame = WebSocketFrameCodec.encodeFrame(sendsText ? .text : .binary, payload: data)
-        try await NWConnectionAsync.send(connection, frame)
+        try await withTaskCancellationHandler {
+            try Task.checkCancellation()
+            try await NWConnectionAsync.send(connection, frame)
+            try validate(token)
+        } onCancel: { connection.cancel() }
     }
 
     /// Keep-alive for the `RealtimeSocketClient` ping hook. Errors are swallowed — a dead socket
     /// is detected by the watchdog's staleness check, not by ping delivery.
     public func ping() async {
-        guard let connection else { return }
+        guard let connection, isOpen else { return }
         try? await NWConnectionAsync.send(connection, WebSocketFrameCodec.encodeFrame(.ping))
     }
 
     public func receive() async throws -> Data {
-        while true {
-            guard let connection else { throw IoTError.notConnected }
-            if let frame = try decoder.nextFrame() {
-                switch frame.opcode {
-                case .text, .binary, .continuation:
-                    return frame.payload
-                case .ping:
-                    try? await NWConnectionAsync.send(connection, WebSocketFrameCodec.encodeFrame(.pong, payload: frame.payload))
-                    return Data()          // liveness signal upstream; decodes to nil
-                case .pong:
-                    return Data()          // liveness signal upstream; decodes to nil
-                case .close:
-                    await close()
-                    throw IoTError.transport("server closed WebSocket")
+        guard let connection, isOpen, receivingGeneration == nil else { throw IoTError.notConnected }
+        let token = generation
+        receivingGeneration = token
+        defer { if receivingGeneration == token { receivingGeneration = nil } }
+        do {
+            return try await withTaskCancellationHandler {
+                while true {
+                    try validate(token)
+                    if let frame = try decoder.nextFrame() {
+                        switch frame.opcode {
+                        case .text, .binary, .continuation:
+                            if let message = try assembler.consume(frame) { return message }
+                            continue
+                        case .ping:
+                            try await NWConnectionAsync.send(connection, WebSocketFrameCodec.encodeFrame(.pong, payload: frame.payload))
+                            try validate(token)
+                            return Data()
+                        case .pong: return Data()
+                        case .close: throw IoTError.transport("server closed WebSocket")
+                        }
+                    }
+                    let chunk = try await NWConnectionAsync.receiveChunk(connection)
+                    try validate(token)
+                    decoder.append(chunk)
                 }
-            }
-            decoder.append(try await NWConnectionAsync.receiveChunk(connection))
+            } onCancel: { connection.cancel() }
+        } catch {
+            if generation == token { await close() }
+            if Task.isCancelled { throw CancellationError() }
+            throw error
         }
     }
 
+    deinit { connection?.cancel() }
+
     public func close() async {
-        guard let conn = connection else { return }
+        generation &+= 1
+        isOpen = false
+        receivingGeneration = nil
+        let conn = connection
         connection = nil
-        // Best-effort close frame, then tear down. Cancelling makes any in-flight receive throw —
-        // exactly what the RealtimeSocketClient watchdog relies on.
-        conn.send(content: WebSocketFrameCodec.encodeFrame(.close),
-                  completion: .contentProcessed { _ in conn.cancel() })
+        decoder = WebSocketFrameDecoder()
+        assembler = WebSocketMessageAssembler()
+        // Teardown must not depend on a send callback from an already dead connection.
+        conn?.cancel()
     }
 
-    // MARK: - NWConnection plumbing (shared helpers in NWConnectionAsync)
-
-    /// Read raw bytes until the `\r\n\r\n` end of the HTTP upgrade response (8 KB cap). Any body
-    /// bytes beyond the separator are fed to the frame decoder — servers may pipeline the first
-    /// frame into the same TCP segment.
-    private func readUntilHeaderEnd(_ connection: NWConnection) async throws -> Data {
+    /// The deadline in open() covers the entire HTTP upgrade, not only TCP establishment.
+    private func readUntilHeaderEnd(_ connection: NWConnection, generation token: UInt64) async throws -> Data {
         var buffer = Data()
         let separator = Data("\r\n\r\n".utf8)
         while true {
-            buffer.append(try await NWConnectionAsync.receiveChunk(connection))
+            let chunk = try await NWConnectionAsync.receiveChunk(connection)
+            try validate(token)
+            buffer.append(chunk)
             if let range = buffer.range(of: separator) {
+                guard buffer.distance(from: buffer.startIndex, to: range.upperBound) <= 8192 else { throw IoTError.invalidResponse }
                 let remainder = buffer[range.upperBound...]
                 if !remainder.isEmpty { decoder.append(Data(remainder)) }
                 return Data(buffer[..<range.upperBound])

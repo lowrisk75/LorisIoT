@@ -1,15 +1,16 @@
 import Foundation
 
-/// Where a control call runs. A **system extension** (Widget, Control Center, Siri App Intent) usually
-/// **cannot reach the LAN** (Local Network privilege is unreliable outside the app process), so a
-/// provider with both a local and a remote transport must go **remote-first** there — never hang on a
-/// LAN call that will time out. In the app, local-first is correct (fast + private).
-///
-/// Detect it in the host app with `Bundle.main.bundlePath.hasSuffix(".appex")` and pass it in.
+/// Where a control call runs. This alone does not establish Local Network authorization or reachability.
 public enum ExecutionContext: Sendable, Equatable {
     case app
     case systemExtension
 
-    /// True when the LAN should be skipped in favour of the remote path first.
+    /// Historical preference retained for source compatibility. Use an explicit routing policy.
+    @available(*, deprecated, message: "Execution context does not establish network permission. Use TransportRoutingPolicy.")
     public var prefersRemoteTransport: Bool { self == .systemExtension }
+}
+
+/// Caller-selected routing, independent of extension identity. Fallback still requires replay safety.
+public enum TransportRoutingPolicy: Sendable, Equatable {
+    case localOnly, localFirst, remoteOnly, remoteFirst
 }

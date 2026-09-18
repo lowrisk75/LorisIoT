@@ -1,6 +1,7 @@
 import Foundation
 import CryptoKit
 import IoTCore
+import IoTCore
 
 /// Versioned, signed automation payload for Node-RED / generic webhooks. `v` lets flows evolve
 /// without breaking; `eventId` gives idempotency; `ts` gives replay protection.
@@ -67,13 +68,15 @@ public struct WebhookClient: Sendable {
 
 /// Production `WebhookHTTP` over URLSession (bounded, no cookies).
 public struct WebhookURLSessionHTTP: WebhookHTTP {
+    private let client = BoundedHTTPClient()
     public init() {}
     public func post(url: URL, body: Data, headers: [String: String]) async throws -> Int {
         var r = URLRequest(url: url); r.httpMethod = "POST"; r.timeoutInterval = 12; r.httpBody = body
         for (k, v) in headers { r.setValue(v, forHTTPHeaderField: k) }
-        let cfg = URLSessionConfiguration.ephemeral; cfg.httpCookieStorage = nil
-        guard let (_, resp) = try? await URLSession(configuration: cfg).data(for: r),
-              let http = resp as? HTTPURLResponse else { throw WebhookError.transport }
-        return http.statusCode
+        do {
+            let (_, response) = try await client.data(for: r, maxBytes: 65_536)
+            return response.statusCode
+        } catch is CancellationError { throw CancellationError() }
+        catch { throw WebhookError.transport }
     }
 }

@@ -37,7 +37,44 @@ public struct CapabilityID: RawRepresentable, Codable, Hashable, Sendable, Expre
 // MARK: - Closed, serializable value model
 
 public enum UnitSymbol: String, Codable, Hashable, Sendable {
-    case percent, celsius, fahrenheit, kelvin, watt, kilowattHour, volt, ampere, lux, second, degree, ppm, none
+    case percent, celsius, fahrenheit, kelvin, watt, kilowatt, kilowattHour, volt, ampere, lux, second, degree, ppm, none
+
+    public var symbol: String {
+        switch self {
+        case .percent: "%"
+        case .celsius: "°C"
+        case .fahrenheit: "°F"
+        case .kelvin: "K"
+        case .watt: "W"
+        case .kilowatt: "kW"
+        case .kilowattHour: "kWh"
+        case .volt: "V"
+        case .ampere: "A"
+        case .lux: "lx"
+        case .second: "s"
+        case .degree: "°"
+        case .ppm: "ppm"
+        case .none: ""
+        }
+    }
+    public static func from(symbol: String?) -> Self? {
+        switch symbol {
+        case "%": .percent
+        case "°C": .celsius
+        case "°F": .fahrenheit
+        case "K": .kelvin
+        case "W": .watt
+        case "kW": .kilowatt
+        case "kWh": .kilowattHour
+        case "V": .volt
+        case "A": .ampere
+        case "lx": .lux
+        case "s": .second
+        case "°": .degree
+        case "ppm": .ppm
+        default: nil
+        }
+    }
 }
 
 /// A JSON-like but closed & Sendable value — a provider can never inject a non-Sendable reference.
@@ -72,15 +109,17 @@ public struct DeviceState: Codable, Hashable, Sendable {
     public let deviceID: DeviceID
     public let availability: DeviceAvailability
     public let primaryValue: StateValue?
+    public let primaryUnit: UnitSymbol?
     public let attributes: [String: StateAttribute]
     public let observedAt: Date
     public let receivedAt: Date
     public let origin: StateOrigin
     public let revision: StateRevision
-    public init(deviceID: DeviceID, availability: DeviceAvailability, primaryValue: StateValue? = nil,
+    public init(deviceID: DeviceID, availability: DeviceAvailability, primaryValue: StateValue? = nil, primaryUnit: UnitSymbol? = nil,
                 attributes: [String: StateAttribute] = [:], observedAt: Date, receivedAt: Date = Date(),
                 origin: StateOrigin, revision: StateRevision) {
         self.deviceID = deviceID; self.availability = availability; self.primaryValue = primaryValue
+        self.primaryUnit = primaryUnit
         self.attributes = attributes; self.observedAt = observedAt; self.receivedAt = receivedAt
         self.origin = origin; self.revision = revision
     }

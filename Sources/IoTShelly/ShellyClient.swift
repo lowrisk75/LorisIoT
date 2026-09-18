@@ -16,6 +16,8 @@ public struct ShellyInfo: Sendable, Equatable {
     public let generation: Int
     public let mac: String        // lowercased = cloud id
     public let switchCount: Int
+    public let switchIDs: [Int]
+    public let firmwareVersion: String?
 }
 
 /// Local Shelly Gen2/3 client over LAN JSON-RPC. Gen1 (URL HTTP) is handled by a separate path when
@@ -35,10 +37,13 @@ public actor ShellyClient {
         let info = try await rpc.call(host: host, password: password, method: "Shelly.GetDeviceInfo", params: [:])
         let name = (info["name"] as? String) ?? (info["id"] as? String) ?? "Shelly"
         let model = (info["model"] as? String) ?? (info["app"] as? String) ?? ""
-        let gen = (info["gen"] as? Int) ?? 2
+        guard let gen = info["gen"] as? Int, gen >= 2,
+              !model.isEmpty, let identity = info["id"] as? String, !identity.isEmpty else { throw IoTError.invalidResponse }
         let mac = ((info["mac"] as? String) ?? "").lowercased()
-        let switches = try await switchCount()
-        return ShellyInfo(name: name, model: model, generation: gen, mac: mac, switchCount: max(1, switches))
+        guard mac.utf8.count == 12, mac.allSatisfy(\.isHexDigit) else { throw IoTError.invalidResponse }
+        let switches = try await switchIDs()
+        return ShellyInfo(name: name, model: model, generation: gen, mac: mac, switchCount: switches.count,
+                          switchIDs: switches, firmwareVersion: info["ver"] as? String)
     }
 
     /// Discover available RPC methods for THIS device (Shelly.ListMethods) — feeds capability discovery.
@@ -48,12 +53,19 @@ public actor ShellyClient {
         return Set(methods)
     }
 
-    private func switchCount() async throws -> Int {
-        guard let r = try? await rpc.call(host: host, password: password, method: "Shelly.GetComponents",
-                                          params: ["dynamic_only": false]),
-              let comps = r["components"] as? [[String: any Sendable]] else { return 1 }
-        let n = comps.compactMap { $0["key"] as? String }.filter { $0.hasPrefix("switch:") }.count
-        return n == 0 ? 1 : n
+    /// Typed higher-level operations retain transport errors instead of reducing uncertainty to Bool.
+    public func call(method: String, params: [String: any Sendable] = [:]) async throws -> [String: any Sendable] {
+        try Task.checkCancellation()
+        return try await rpc.call(host: host, password: password, method: method, params: params)
+    }
+
+    private func switchIDs() async throws -> [Int] {
+        let status = try await rpc.call(host: host, password: password, method: "Shelly.GetStatus", params: [:])
+        guard !status.isEmpty, status.count <= 512 else { throw IoTError.invalidResponse }
+        return try status.keys.filter { $0.hasPrefix("switch:") }.map {
+            guard let id = Int($0.dropFirst("switch:".count)), (0...255).contains(id) else { throw IoTError.invalidResponse }
+            return id
+        }.sorted()
     }
 
     /// Current relay state, nil if unknown.
@@ -67,7 +79,7 @@ public actor ShellyClient {
         ((try? await rpc.call(host: host, password: password, method: "Switch.Set", params: ["id": id, "on": on])) != nil)
     }
 
-    /// Install a daily on/off schedule (Shelly cron has no one-shot date). Returns the job id to track.
+    /// Compatibility daily scheduler. Verified scheduling uses ShellyOwnedSchedules and a durable receipt.
     public func createDailySchedule(switchID: Int, on: Bool, hour: Int, minute: Int) async -> Int? {
         let inner: [String: any Sendable] = ["id": switchID, "on": on]
         let call: [String: any Sendable] = ["method": "Switch.Set", "params": inner]

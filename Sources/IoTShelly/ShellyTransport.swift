@@ -4,11 +4,16 @@ import IoTCore
 /// Production `ShellyRPC` over `URLSession`: `POST http://<host>/rpc`, digest-auth retry on 401,
 /// bounded timeout. LAN cleartext → needs `NSAllowsLocalNetworking`.
 public struct ShellyURLSessionRPC: ShellyRPC {
-    public init() {}
+    private let http: BoundedHTTPClient
+    public init(session: URLSession? = nil) { self.http = BoundedHTTPClient(session: session) }
 
     public func call(host: String, password: String?, method: String,
                      params: [String: any Sendable]) async throws -> [String: any Sendable] {
-        guard let url = URL(string: "http://\(host)/rpc") else { throw IoTError.notConfigured }
+        guard let c = URLComponents(string: "http://\(host)"),
+              c.user == nil, c.password == nil, c.query == nil, c.fragment == nil,
+              c.path.isEmpty, let base = c.url, HTTPOrigin(base) != nil,
+              !method.isEmpty else { throw IoTError.notConfigured }
+        let url = base.appendingPathComponent("rpc")
         let body: [String: Any] = ["id": 1, "method": method, "params": params]
         let payload = try JSONSerialization.data(withJSONObject: body)
 
@@ -20,23 +25,23 @@ public struct ShellyURLSessionRPC: ShellyRPC {
             return r
         }
 
-        var (data, response) = try await URLSession.shared.data(for: makeRequest(auth: nil))
-        var http = response as? HTTPURLResponse
-        if http?.statusCode == 401, let password,
-           let challenge = http?.value(forHTTPHeaderField: "WWW-Authenticate"),
+        var (data, response) = try await http.data(for: makeRequest(auth: nil), maxBytes: 1_048_576)
+        if response.statusCode == 401, let password,
+           let challenge = response.value(forHTTPHeaderField: "WWW-Authenticate"),
            let header = ShellyDigest.header(challenge: challenge, password: password) {
-            (data, response) = try await URLSession.shared.data(for: makeRequest(auth: header))
-            http = response as? HTTPURLResponse
+            (data, response) = try await http.data(for: makeRequest(auth: header), maxBytes: 1_048_576)
         }
-        guard let status = http?.statusCode else { throw IoTError.invalidResponse }
+        let status = response.statusCode
         guard (200...299).contains(status) else {
             throw status == 401 ? IoTError.authenticationFailed(reason: "digest") : IoTError.transport("HTTP \(status)")
         }
-        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              json["id"] as? Int == 1 else { throw IoTError.invalidResponse }
         if let err = json["error"] as? [String: Any] {
             throw IoTError.transport((err["message"] as? String) ?? "RPC error")
         }
-        return (json["result"] as? [String: any Sendable]) ?? [:]
+        guard let result = json["result"] as? [String: any Sendable] else { throw IoTError.invalidResponse }
+        return result
     }
 }
 
@@ -64,24 +69,14 @@ protocol ShellyCloudHTTP: Sendable {
 /// carry the authorization key and must never replay it to a different authority.
 final class ShellyCloudURLSessionHTTP: NSObject, ShellyCloudHTTP, URLSessionTaskDelegate, @unchecked Sendable {
     private let maxResponseBytes: Int
-    private let session: URLSession
+    private let http = BoundedHTTPClient()
 
     init(maxResponseBytes: Int = 1024 * 1024) {
         self.maxResponseBytes = maxResponseBytes
-        let configuration = URLSessionConfiguration.ephemeral
-        configuration.timeoutIntervalForRequest = 12
-        configuration.timeoutIntervalForResource = 20
-        configuration.httpCookieStorage = nil
-        configuration.httpShouldSetCookies = false
-        self.session = URLSession(configuration: configuration)
     }
 
     func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
-        let (data, response) = try await session.data(for: request, delegate: self)
-        guard let http = response as? HTTPURLResponse, data.count <= maxResponseBytes else {
-            throw IoTError.invalidResponse
-        }
-        return (data, http)
+        try await http.data(for: request, maxBytes: maxResponseBytes)
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask,

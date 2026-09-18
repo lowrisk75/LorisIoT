@@ -12,33 +12,41 @@ public protocol HAHTTP: Sendable {
 /// same host to prevent a malicious `Location:` exfiltrating the token.
 public final class HAURLSessionHTTP: NSObject, HAHTTP, URLSessionTaskDelegate, @unchecked Sendable {
     private let baseURL: URL
-    private let token: String
+    private let token: @Sendable () async throws -> String
     private let maxBytes: Int
-    private let session: URLSession
+    private let client: BoundedHTTPClient
 
-    public init(baseURL: URL, token: String, maxBytes: Int = 4 * 1024 * 1024) {
+    public convenience init(baseURL: URL, token: String, maxBytes: Int = 4 * 1024 * 1024, session: URLSession? = nil) {
+        self.init(baseURL: baseURL, tokenProvider: { token }, maxBytes: maxBytes, session: session)
+    }
+
+    public init(baseURL: URL, tokenProvider: @escaping @Sendable () async throws -> String,
+                maxBytes: Int = 4 * 1024 * 1024, session: URLSession? = nil) {
         self.baseURL = baseURL
-        self.token = token
+        self.token = tokenProvider
         self.maxBytes = maxBytes
-        let cfg = URLSessionConfiguration.ephemeral
-        cfg.timeoutIntervalForRequest = 12      // don't inherit the 60s default (cellular/Tailscale stalls)
-        cfg.timeoutIntervalForResource = 20
-        cfg.httpCookieStorage = nil
-        cfg.waitsForConnectivity = true
-        self.session = URLSession(configuration: cfg)
+        self.client = BoundedHTTPClient(session: session)
     }
 
     public func send(method: String, path: String, body: Data?) async throws -> (Data, Int) {
-        guard let url = URL(string: path, relativeTo: baseURL) else { throw IoTError.notConfigured }
+        guard let origin = HTTPOrigin(baseURL),
+              !path.hasPrefix("/"), !path.contains("://"), !path.split(separator: "/").contains(".."),
+              let directory = URL(string: baseURL.absoluteString.hasSuffix("/") ? baseURL.absoluteString : baseURL.absoluteString + "/"),
+              let url = URL(string: path, relativeTo: directory)?.absoluteURL,
+              HTTPOrigin(url) == origin else { throw IoTError.notConfigured }
+        // Decided before the token is even read: a bearer never crosses a public network in cleartext.
+        guard origin.permitsCredentials else {
+            throw IoTError.notSupported("Home Assistant over plain HTTP is only allowed on a private network")
+        }
         var req = URLRequest(url: url)
         req.httpMethod = method
-        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let bearer = try await token()
+        guard !bearer.isEmpty, !bearer.contains("\r"), !bearer.contains("\n") else { throw IoTError.notConfigured }
+        req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
-        let (data, response) = try await session.data(for: req, delegate: self)
-        guard let http = response as? HTTPURLResponse else { throw IoTError.invalidResponse }
-        let capped = data.count > maxBytes ? data.prefix(maxBytes) : data
-        return (Data(capped), http.statusCode)
+        let (data, response) = try await client.data(for: req, maxBytes: maxBytes, allowsSameOriginRedirects: true)
+        return (data, response.statusCode)
     }
 
     /// Pin redirects to the same host + block HTTPS→HTTP downgrade (guards the bearer token).
@@ -46,8 +54,6 @@ public final class HAURLSessionHTTP: NSObject, HAHTTP, URLSessionTaskDelegate, @
                            willPerformHTTPRedirection response: HTTPURLResponse,
                            newRequest request: URLRequest,
                            completionHandler: @escaping (URLRequest?) -> Void) {
-        let sameHost = request.url?.host == baseURL.host
-        let noDowngrade = !(baseURL.scheme == "https" && request.url?.scheme == "http")
-        completionHandler(sameHost && noDowngrade ? request : nil)
+        completionHandler(request.url.flatMap(HTTPOrigin.init) == HTTPOrigin(baseURL) ? request : nil)
     }
 }

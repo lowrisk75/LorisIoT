@@ -39,6 +39,94 @@ struct MockRPC: ShellyRPC {
     }
 }
 
+/// Shelly Cloud fixture: device list answers `list`; every other endpoint succeeds.
+private struct CloudFixture: ShellyCloudHTTP {
+    let list: String
+    var status = 200
+    func data(for request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        let isList = request.url?.path == "/interface/device/list"
+        let response = HTTPURLResponse(url: request.url!, statusCode: isList ? status : 200, httpVersion: nil, headerFields: nil)!
+        return (Data((isList ? list : #"{"isok":true}"#).utf8), response)
+    }
+}
+
+/// Answers per host; any host not listed is unreachable on the LAN.
+private struct HostRPC: ShellyRPC {
+    let reachable: Set<String>
+    func call(host: String, password: String?, method: String, params: [String: any Sendable]) async throws -> [String: any Sendable] {
+        guard reachable.contains(host) else { throw IoTError.timeout }
+        switch method {
+        case "Shelly.GetDeviceInfo": return ["gen": 2, "model": "SNSW-001P16EU", "id": "shelly-\(host)", "mac": "aabbccddeeff"]
+        case "Shelly.GetStatus": return ["switch:0": ["output": false] as [String: any Sendable]]
+        default: return [:]
+        }
+    }
+}
+
+@Suite struct ShellyConnectionTests {
+    private func state(_ p: ShellyProvider) async -> ProviderConnectionState? {
+        for await event in await p.connectionEvents() { return event.state }
+        return nil
+    }
+
+    @Test func oneUnreachableDeviceDegradesInsteadOfFailingTheProvider() async throws {
+        let p = ShellyProvider(devices: [.init(id: "a", name: "A", host: "10.0.0.1"),
+                                         .init(id: "b", name: "B", host: "10.0.0.2")],
+                               rpc: HostRPC(reachable: ["10.0.0.1"]))
+        try await p.connect()
+        #expect(await state(p) == .degraded)
+        #expect(try await p.devices().count == 2)
+    }
+
+    @Test func remoteOnlyRoutingDoesNotRequireTheLocalNetwork() async throws {
+        let p = ShellyProvider(devices: [.init(id: "a", name: "A", host: "10.0.0.1", mac: "AABBCCDDEEFF")],
+                               cloud: .init(server: "shelly-1-eu.shelly.cloud", authKey: "fixture"),
+                               rpc: HostRPC(reachable: []), routing: .remoteOnly)
+        await p.useCloudHTTP(CloudFixture(list: #"{"isok":true,"data":{"devices":{"aabbccddeeff":{"name":"A","online":1}}}}"#))
+        try await p.connect()
+        #expect(await state(p) == .connected)
+    }
+
+    /// Remote-only has no LAN proof, so "connected" must come from the cloud confirming each device.
+    @Test func remoteOnlyIsNotConnectedWithoutCloudConfirmation() async throws {
+        let config = ShellyDeviceConfig(id: "a", name: "A", host: "10.0.0.1", mac: "aabbccddeeff")
+        let cloud = ShellyCloudConfig(server: "shelly-1-eu.shelly.cloud", authKey: "fixture")
+        let cases: [(CloudFixture, ProviderConnectionState)] = [
+            (CloudFixture(list: #"{"isok":false}"#, status: 401), .degraded),
+            (CloudFixture(list: #"{"isok":true,"data":{"devices":{"112233445566":{"online":1}}}}"#), .degraded),
+            (CloudFixture(list: #"{"isok":true,"data":{"devices":{"aabbccddeeff":{"online":0}}}}"#), .degraded),
+        ]
+        for (fixture, expected) in cases {
+            let p = ShellyProvider(devices: [config], cloud: cloud, rpc: HostRPC(reachable: []), routing: .remoteOnly)
+            await p.useCloudHTTP(fixture)
+            try? await p.connect()
+            #expect(await state(p) == expected)
+        }
+        let unbound = ShellyProvider(devices: [.init(id: "a", name: "A", host: "10.0.0.1")], cloud: cloud,
+                                     rpc: HostRPC(reachable: []), routing: .remoteOnly)
+        await unbound.useCloudHTTP(CloudFixture(list: #"{"isok":true,"data":{"devices":{}}}"#))
+        await #expect(throws: IoTError.notConfigured) { try await unbound.connect() }
+    }
+
+    /// A cloud send only queues the command; a LAN read that still shows the old value is not a refusal.
+    @Test func cloudSendNotYetVisibleOnTheLANIsAcceptedNotRejected() async throws {
+        let p = ShellyProvider(devices: [.init(id: "a", name: "A", host: "10.0.0.1", mac: "aabbccddeeff")],
+                               cloud: .init(server: "shelly-1-eu.shelly.cloud", authKey: "fixture"),
+                               rpc: MockRPC { method, _ in method == "Switch.GetStatus" ? ["output": false] : [:] },
+                               routing: .remoteFirst)
+        await p.useCloudHTTP(CloudFixture(list: #"{"isok":true}"#))
+        let control = try #require(try await p.capabilities(for: "a").control)
+        let receipt = try await control.execute(SetPowerCommand(deviceID: "a", isOn: true))
+        #expect(receipt.outcome == .accepted)
+    }
+
+    @Test func everyDeviceUnreachableWithoutCloudIsStillAFailure() async {
+        let p = ShellyProvider(devices: [.init(id: "a", name: "A", host: "10.0.0.1")], rpc: HostRPC(reachable: []))
+        await #expect(throws: (any Error).self) { try await p.connect() }
+        #expect(await state(p) == .degraded)
+    }
+}
+
 @Suite struct ShellyProviderTests {
     private func provider(_ handler: @escaping @Sendable (String, [String: any Sendable]) throws -> [String: any Sendable],
                           cloud: ShellyCloudConfig? = nil) -> ShellyProvider {
@@ -77,7 +165,7 @@ struct MockRPC: ShellyRPC {
         #expect(devices.first?.kind == .outlet)
         let caps = try await p.capabilities(for: "plug1")
         #expect(caps.control != nil)
-        #expect(caps.schedule != nil)
+        #expect(caps.schedule == nil) // No durable ownership journal or full method qualification.
         #expect(caps.readState != nil)
     }
 }
