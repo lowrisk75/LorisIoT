@@ -35,6 +35,7 @@ class Runtime:
     async def _run(self, record):
         confirmed = False
         command = None
+        due = record['autoOffAt'] if record['state'] == 'offExecuting' else record['start']
         deadline = asyncio.get_running_loop().time() + self.command_timeout
         try:
             # Queue only within the same total deadline used for execution. A stuck
@@ -50,7 +51,7 @@ class Runtime:
             remaining = deadline - asyncio.get_running_loop().time()
             if (not self._stopped and len(self._commands) < 8
                     and remaining > 0
-                    and record['start'] <= self.store.clock() <= record['start'] + self.store.MAX_LATE_SECONDS):
+                    and due <= self.store.clock() <= due + self.store.MAX_LATE_SECONDS):
                 command = asyncio.create_task(self.execute(record))
                 self._commands.add(command)
                 command.add_done_callback(self._command_finished)

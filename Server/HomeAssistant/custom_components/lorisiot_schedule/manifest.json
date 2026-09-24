@@ -1,10 +1,12 @@
 {
   "domain": "lorisiot_schedule",
   "name": "LorisIoT Schedules",
-  "version": "0.1.0",
+  "version": "0.3.2",
   "codeowners": [],
-  "dependencies": ["http"],
-  "documentation": "https://github.com/lowrisk75/LorisIoT/tree/main/Server/HomeAssistant",
+  "dependencies": [
+    "http"
+  ],
+  "documentation": "https://github.com/lowrisk75/LorisIoT/tree/ha-schedule-v0.3.2/Server/HomeAssistant",
   "integration_type": "service",
   "iot_class": "local_push",
   "requirements": []

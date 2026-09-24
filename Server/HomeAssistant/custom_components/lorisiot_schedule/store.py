@@ -61,9 +61,10 @@ class Store:
     # A lease bounds a zombie intent: an owner that stops renewing stops arming the home. It does
     # not bound a cancellation, whose owner is alive and whose lease is still fresh.
     LEASE_FIELDS = {'expiresAt'}
-    OPTIONAL_FIELDS = RAMP_FIELDS | LEASE_FIELDS
+    OPTIONAL_FIELDS = RAMP_FIELDS | LEASE_FIELDS | {'autoOffAt'}
     MAX_TRANSITION_SECONDS = 3600
-    STATES = {'armed', 'disabled', 'executing', 'applied', 'uncertain', 'missed', 'expired', 'removed'}
+    STATES = {'armed', 'disabled', 'executing', 'applied', 'uncertain', 'missed', 'expired', 'removed',
+              'holding', 'offExecuting', 'completed', 'overridden'}
 
     def __init__(self, path, allowed_targets, *, clock=time.time, max_records=1024):
         self.path = Path(path)
@@ -87,7 +88,7 @@ class Store:
             raise InvalidRequest('Journal exceeds its size bound')
         with self._db(write=True) as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 2):
+            if version not in (0, 2, 3):
                 raise InvalidRequest('Unsupported journal version')
             db.execute('''CREATE TABLE IF NOT EXISTS schedules (
                 remote_id TEXT PRIMARY KEY, user_id TEXT NOT NULL,
@@ -95,7 +96,8 @@ class Store:
                 start REAL NOT NULL, state TEXT NOT NULL,
                 revision INTEGER NOT NULL, updated_at REAL NOT NULL)''')
             db.execute("CREATE UNIQUE INDEX IF NOT EXISTS active_identity ON schedules(identity) WHERE state!='removed'")
-            db.execute('PRAGMA user_version=2')
+            # Version 3 adds session states. Older servers fail closed rather than replaying them.
+            db.execute('PRAGMA user_version=3')
             rows = db.execute('SELECT * FROM schedules LIMIT 1025').fetchall()
             if len(rows) > 1024:
                 raise JournalCorrupt('Journal exceeds its record bound')
@@ -152,6 +154,16 @@ class Store:
                 raise InvalidRequest('Lease expiry must be a finite UTC timestamp')
             expires = float(expires)
         result['expiresAt'] = expires
+        if 'autoOffAt' in value:
+            off = value['autoOffAt']
+            if (not value['deviceID'].startswith('light.') or not value['on'] or not value['enabled']
+                    or result['level'] is None or result['level'] <= 0
+                    or result['transition'] is None or not 60 <= result['transition'] <= 1800
+                    or type(off) not in (int, float) or not math.isfinite(off)
+                    or not 60 <= off - result['start'] - result['transition'] <= 180 * 60
+                    or expires is not None):
+                raise InvalidRequest('Invalid sunrise session')
+            result['autoOffAt'] = float(off)
         return result
 
     @staticmethod
@@ -203,6 +215,8 @@ class Store:
                     or (row['state'] == 'armed' and not result['enabled'])
                     or (row['state'] == 'disabled' and result['enabled'])):
                 raise InvalidRequest('Inconsistent journal record')
+            if row['state'] in ('holding', 'offExecuting', 'completed', 'overridden') and 'autoOffAt' not in result:
+                raise InvalidRequest('Session state without a session')
         except (ValueError, TypeError, KeyError, OverflowError) as error:
             raise JournalCorrupt('Invalid persisted schedule; execution is blocked') from error
         result.update(userID=row['user_id'], state=row['state'], revision=row['revision'], updatedAt=row['updated_at'])
@@ -229,7 +243,7 @@ class Store:
                     raise Conflict('Ownership mismatch')
                 if row['payload'] == payload:
                     return self._record(row)
-                if row['revision'] != expected_revision or row['state'] in ('executing', 'uncertain'):
+                if row['revision'] != expected_revision or row['state'] in ('executing', 'offExecuting', 'holding', 'uncertain', 'removed'):
                     raise Conflict('Schedule changed or execution is uncertain')
             elif expected_revision is not None:
                 raise Conflict('Missing previous revision')
@@ -238,6 +252,15 @@ class Store:
                 raise InvalidRequest('Schedule must be 15 seconds to 366 days ahead')
             if request['expiresAt'] is not None and not now <= request['expiresAt'] <= now + 366 * 86400:
                 raise InvalidRequest('Lease expiry must be now to 366 days ahead')
+            # A second owned sunrise must not later extinguish another active session's lamp.
+            if 'autoOffAt' in request and request['enabled']:
+                for candidate in db.execute("SELECT * FROM schedules WHERE state IN ('armed','executing','holding','offExecuting') AND remote_id!=?",
+                                            (request['remoteID'],)).fetchall():
+                    other_record = self._record(candidate)
+                    if (other_record['deviceID'] == request['deviceID'] and 'autoOffAt' in other_record
+                            and request['start'] <= other_record['autoOffAt']
+                            and other_record['start'] <= request['autoOffAt']):
+                        raise Conflict('Overlapping sunrise session')
             state = 'armed' if request['enabled'] else 'disabled'
             other = db.execute("SELECT remote_id FROM schedules WHERE identity=? AND state!='removed' AND remote_id!=?",
                                (identity, request['remoteID'])).fetchone()
@@ -258,6 +281,31 @@ class Store:
             result = self._record(db.execute('SELECT * FROM schedules WHERE remote_id=?', (request['remoteID'],)).fetchone())
         return result  # COMMIT has completed before an acknowledgement escapes.
 
+    def retire_absent_sunrise(self, user_id, request):
+        """Confirm an absent, fully elapsed session with a durable cancellation tombstone."""
+        user_id = identifier(user_id)
+        request = self._request(request)
+        now = self._now()
+        if 'autoOffAt' not in request or now <= request['autoOffAt'] + self.MAX_LATE_SECONDS:
+            raise Conflict('Session has not fully elapsed')
+        identity = self._identity(user_id, request)
+        payload = json.dumps(request, sort_keys=True, separators=(',', ':'))
+        with self._db(write=True) as db:
+            row = db.execute('SELECT * FROM schedules WHERE remote_id=?', (request['remoteID'],)).fetchone()
+            if row is not None:
+                self._record(row)
+                if (row['identity'] != identity or row['user_id'] != user_id
+                        or row['payload'] != payload or row['state'] != 'removed'):
+                    raise Conflict('An existing receipt must be reconciled, never replaced')
+                return self._record(row)
+            if db.execute('SELECT count(*) FROM schedules').fetchone()[0] >= self.max_records:
+                raise Conflict('Schedule journal is full; existing intents are preserved')
+            db.execute('INSERT INTO schedules VALUES (?,?,?,?,?,?,?,?)',
+                       (request['remoteID'], user_id, identity, payload, request['start'], 'removed', 1, now))
+            result = self._record(db.execute('SELECT * FROM schedules WHERE remote_id=?',
+                                            (request['remoteID'],)).fetchone())
+        return result
+
     def remove(self, user_id, remote_id, owner, expected_revision):
         remote_id = uuid_string(remote_id)
         owner = owner_value(owner)
@@ -271,26 +319,46 @@ class Store:
                 raise Conflict('Ownership mismatch')
             if record['state'] == 'removed':
                 return record
-            if record['revision'] != expected_revision or record['state'] in ('executing', 'uncertain'):
+            if record['revision'] != expected_revision or record['state'] in ('executing', 'offExecuting', 'uncertain'):
                 raise Conflict('Cancellation cannot be confirmed')
             db.execute("UPDATE schedules SET state='removed', revision=revision+1, updated_at=? WHERE remote_id=?",
                        (self._now(), remote_id))
             result = self._record(db.execute('SELECT * FROM schedules WHERE remote_id=?', (remote_id,)).fetchone())
         return result
 
+    def claim_ramp_step(self, remote_id, expected_revision):
+        """Serialize a step with cancellation using the existing durable executing state."""
+        now = self._now()
+        with self._db(write=True) as db:
+            row = db.execute('SELECT * FROM schedules WHERE remote_id=?',
+                             (uuid_string(remote_id),)).fetchone()
+            record = self._record(row)
+            if (record['state'] != 'holding' or record['revision'] != expected_revision
+                    or 'autoOffAt' not in record or record['deviceID'] not in self.targets
+                    or not record['start'] < now <= record['start'] + record['transition'] + 5):
+                raise Conflict('Ramp step no longer owned or due')
+            db.execute("UPDATE schedules SET state='executing', revision=revision+1, updated_at=? WHERE remote_id=?",
+                       (now, remote_id))
+            return self._record(db.execute('SELECT * FROM schedules WHERE remote_id=?', (remote_id,)).fetchone())
+
     def claim_due(self):
         now = self._now()
         result = []
         with self._db(write=True) as db:
-            rows = db.execute("SELECT * FROM schedules WHERE state='armed' AND start<=? ORDER BY start LIMIT 32", (now,)).fetchall()
+            rows = db.execute("""SELECT * FROM schedules WHERE (state='armed' AND start<=?)
+                OR (state='holding' AND json_extract(payload, '$.autoOffAt')<=?)
+                ORDER BY start LIMIT 32""", (now, now)).fetchall()
             for row in rows:
                 record = self._record(row)
-                state = ('missed' if now - row['start'] > self.MAX_LATE_SECONDS
+                is_off = row['state'] == 'holding'
+                due = record['autoOffAt'] if is_off else row['start']
+                state = ('missed' if now - due > self.MAX_LATE_SECONDS
                          else 'expired' if record['expiresAt'] is not None and record['expiresAt'] < now
-                         else 'uncertain' if record['deviceID'] not in self.targets else 'executing')
+                         else 'uncertain' if record['deviceID'] not in self.targets
+                         else 'offExecuting' if is_off else 'executing')
                 db.execute('UPDATE schedules SET state=?, revision=revision+1, updated_at=? WHERE remote_id=?',
                            (state, now, row['remote_id']))
-                if state == 'executing':
+                if state in ('executing', 'offExecuting'):
                     result.append(self._record(db.execute('SELECT * FROM schedules WHERE remote_id=?', (row['remote_id'],)).fetchone()))
         return result  # A process crash from here onward leaves an uncertain intent, never a replay.
 
@@ -298,9 +366,22 @@ class Store:
         if type(confirmed) is not bool:
             raise InvalidRequest('Confirmation must be boolean')
         with self._db(write=True) as db:
-            db.execute("UPDATE schedules SET state=?, revision=revision+1, updated_at=? WHERE remote_id=? AND revision=? AND state='executing'",
-                       ('applied' if confirmed else 'uncertain', self._now(), uuid_string(remote_id), revision))
+            row = db.execute('SELECT * FROM schedules WHERE remote_id=?', (uuid_string(remote_id),)).fetchone()
+            record = self._record(row)
+            state = ('uncertain' if not confirmed else 'completed' if record['state'] == 'offExecuting'
+                     else 'holding' if 'autoOffAt' in record else 'applied')
+            db.execute("UPDATE schedules SET state=?, revision=revision+1, updated_at=? WHERE remote_id=? AND revision=? AND state IN ('executing','offExecuting')",
+                       (state, self._now(), uuid_string(remote_id), revision))
+
+    def revoke_sunrise(self, device_id):
+        """A foreign state/command was observed. Never restore ownership from a later matching value."""
+        with self._db(write=True) as db:
+            db.execute("""UPDATE schedules SET state='overridden', revision=revision+1, updated_at=?
+                WHERE state IN ('executing','holding','offExecuting')
+                AND json_extract(payload, '$.autoOffAt') IS NOT NULL
+                AND json_extract(payload, '$.deviceID')=?""", (self._now(), device_id))
 
     def recover_uncertain(self):
         with self._db(write=True) as db:
-            db.execute("UPDATE schedules SET state='uncertain', revision=revision+1, updated_at=? WHERE state='executing'", (self._now(),))
+            # During downtime we cannot observe a manual takeover: preserve the receipt, not OFF authority.
+            db.execute("UPDATE schedules SET state='uncertain', revision=revision+1, updated_at=? WHERE state IN ('executing','holding','offExecuting')", (self._now(),))
