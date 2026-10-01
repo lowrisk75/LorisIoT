@@ -4,8 +4,29 @@ import IoTCore
 @testable import IoTMatter
 #if canImport(Matter)
 import Matter
+import Security
 
 struct NativeMatterTests {
+    @Test func persistedRootKeySignsWithTheSamePublicIdentityAfterReopen() throws {
+        let representation = try MatterRootSigner.generateRepresentation()
+        let first = try MatterRootSigner(privateRepresentation: representation)
+        let reopened = try MatterRootSigner(privateRepresentation: representation)
+        #expect(try first.publicRepresentation() == reopened.publicRepresentation())
+        let message = Data("root-signing-contract".utf8)
+        let signature = reopened.signMessageECDSA_DER(message)
+        #expect(SecKeyVerifySignature(first.copyPublicKey(), .ecdsaSignatureMessageX962SHA256,
+            message as CFData, signature as CFData, nil))
+        let certificate = try MTRCertificates.createRootCertificate(first, issuerID: 1, fabricID: 123)
+        #expect(MTRCertificates.keypair(reopened, matchesCertificate: certificate))
+        #expect(throws: MatterFabricError.corruptStorage) { try MatterRootSigner(privateRepresentation: Data(count: 20)) }
+    }
+    @Test @MainActor func emptyTrustAndInvalidKeychainNamespaceAreRejectedBeforeStartingMatter() {
+        #expect(throws: MatterFabricError.invalidConfiguration) {
+            try MatterFabric.create(service: "test.fabric", vendorID: 0x1234, fabricID: 123, trustedPAAs: [])
+        }
+        #expect(throws: MatterFabricError.invalidConfiguration) { try MatterKeychainStorage(service: "") }
+        #expect(throws: MatterFabricError.invalidConfiguration) { try MatterKeychainStorage(service: "other/service") }
+    }
     private func row(_ cluster: UInt32, type: String, value: Any? = nil, endpoint: UInt16 = 1) -> [String: Any] {
         var data: [String: Any] = [MTRTypeKey: type]
         data[MTRValueKey] = value
