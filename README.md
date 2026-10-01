@@ -45,3 +45,9 @@ IoTHomeAssistant · IoTShelly · IoTMQTT · IoTHomeKit · IoTWebhook   ← satel
 swift build
 swift test
 ```
+
+## Confirmed wake occurrences
+
+The durable multi-device coordinator and HA/Shelly/HomeKit adapters are documented in
+[Multi-device wake](Docs/MULTI-DEVICE-WAKE.md). One-shot readback, cancellation and recovery are
+fixture-tested; hardware and release qualification remain separate gates.

@@ -48,7 +48,7 @@ final class NativeHomeKitBridge: HomeKitDeviceTransport {
                 name: accessory.name,
                 kind: accessory.services.contains(where: { $0.serviceType == HMServiceTypeLightbulb }) ? .light : .switchDevice,
                 readable: power.properties.contains(HMCharacteristicPropertyReadable),
-                writable: power.properties.contains(HMCharacteristicPropertyWritable), supportsTimers: timers)
+                writable: power.properties.contains(HMCharacteristicPropertyWritable), supportsTimers: timers && accessory.services.flatMap(\.characteristics).filter { $0.characteristicType == HMCharacteristicTypePowerState }.count == 1)
         }
     }
     func readPower(_ deviceID: DeviceID) async throws -> Bool {
@@ -75,7 +75,7 @@ final class NativeHomeKitBridge: HomeKitDeviceTransport {
         guard case .setPower(let on) = schedule.command,
               !home.triggers.contains(where: { $0.name == name }),
               !home.actionSets.contains(where: { $0.name == name }) else { throw IoTError.unconfirmed }
-        let set: HMActionSet = try await callback { resolve in
+        let set: HMActionSet = try await callback(waitForUnderlyingCompletion: true) { resolve in
             home.addActionSet(withName: name) { set, error in
                 if let error { resolve(.failure(error)) }
                 else if let set { resolve(.success(set)) }
@@ -83,14 +83,14 @@ final class NativeHomeKitBridge: HomeKitDeviceTransport {
             }
         }
         let action = HMCharacteristicWriteAction(characteristic: characteristic, targetValue: NSNumber(value: on))
-        try await mutate { set.addAction(action, completionHandler: $0) }
+        try await mutate(waitForUnderlyingCompletion: true) { set.addAction(action, completionHandler: $0) }
         let trigger = HMTimerTrigger(name: name, fireDate: schedule.start, recurrence: nil)
-        try await mutate { home.addTrigger(trigger, completionHandler: $0) }
-        try await mutate { trigger.addActionSet(set, completionHandler: $0) }
+        try await mutate(waitForUnderlyingCompletion: true) { home.addTrigger(trigger, completionHandler: $0) }
+        try await mutate(waitForUnderlyingCompletion: true) { trigger.addActionSet(set, completionHandler: $0) }
         // New triggers start disabled. Verify every construction step before enabling.
         guard trigger.actionSets.count == 1, trigger.actionSets.first?.uniqueIdentifier == set.uniqueIdentifier,
               actionMatches(set, schedule: schedule), !trigger.isEnabled else { throw IoTError.unconfirmed }
-        if schedule.isEnabled { try await mutate { trigger.enable(true, completionHandler: $0) } }
+        if schedule.isEnabled { try await mutate(waitForUnderlyingCompletion: true) { trigger.enable(true, completionHandler: $0) } }
         #else
         throw IoTError.notSupported("HomeKit timer provisioning is unavailable on this platform")
         #endif
@@ -125,14 +125,14 @@ final class NativeHomeKitBridge: HomeKitDeviceTransport {
             guard let timer = trigger as? HMTimerTrigger, matches(timer, schedule: schedule, name: name) else {
                 throw IoTError.unconfirmed
             }
-            try await mutate { home.removeTrigger(trigger, completionHandler: $0) }
+            try await mutate(waitForUnderlyingCompletion: true) { home.removeTrigger(trigger, completionHandler: $0) }
         }
         if let set = sets.first {
             guard actionMatches(set, schedule: schedule),
                   !home.triggers.contains(where: { $0.actionSets.contains(where: { $0.uniqueIdentifier == set.uniqueIdentifier }) }) else {
                 throw IoTError.unconfirmed
             }
-            try await mutate { home.removeActionSet(set, completionHandler: $0) }
+            try await mutate(waitForUnderlyingCompletion: true) { home.removeActionSet(set, completionHandler: $0) }
         }
         guard !home.triggers.contains(where: { $0.name == name }),
               !home.actionSets.contains(where: { $0.name == name }) else { throw IoTError.unconfirmed }
@@ -141,18 +141,26 @@ final class NativeHomeKitBridge: HomeKitDeviceTransport {
         #endif
     }
 
-    private func mutate(_ start: (@escaping @Sendable ((any Error)?) -> Void) -> Void) async throws {
-        let _: Void = try await callback { resolve in
+    private func mutate(waitForUnderlyingCompletion: Bool = false, _ start: (@escaping @Sendable ((any Error)?) -> Void) -> Void) async throws {
+        let _: Void = try await callback(waitForUnderlyingCompletion: waitForUnderlyingCompletion) { resolve in
             start { error in
                 if let error { resolve(.failure(error)) } else { resolve(.success(())) }
             }
         }
     }
     private func callback<Value: Sendable>(
+        waitForUnderlyingCompletion: Bool = false,
         _ start: (@escaping @Sendable (Result<Value, any Error>) -> Void) -> Void
     ) async throws -> Value {
         try Task.checkCancellation()
         let gate = HomeKitCallback<Value>()
+        // HomeKit mutations cannot be cancelled. Keep the owned operation lease until Apple's
+        // callback actually returns; WakeCoordinator bounds the caller without releasing that lease.
+        if waitForUnderlyingCompletion {
+            return try await withCheckedThrowingContinuation { continuation in
+                if gate.install(continuation) { start { gate.finish($0) } }
+            }
+        }
         let timeout = Task {
             do { try await Task.sleep(for: .seconds(20)); gate.finish(.failure(IoTError.timeout)) }
             catch {}

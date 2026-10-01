@@ -4,6 +4,7 @@ Run explicitly using the pinned qualification environment. No default_config, di
 physical integration or user configuration is loaded. Tokens and databases are disposable.
 """
 import asyncio
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -25,7 +26,8 @@ from custom_components.lorisiot_schedule import CONFIG_SCHEMA, DOMAIN, PREFIX, a
 
 class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.assertEqual(__version__, '2026.9.1', 'Requalify new HA versions explicitly')
+        self.assertEqual(__version__, os.environ.get('LORISIOT_HA_TEST_VERSION', '2026.9.1'),
+                         'Requalify new HA versions explicitly')
         self.directory = tempfile.TemporaryDirectory(prefix='lorisiot-ha-http-fixture-')
         self.addCleanup(self.directory.cleanup)
         self.hass = HomeAssistant(self.directory.name)
@@ -45,7 +47,9 @@ class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
         await server.async_initialize(cors_origins=[], use_x_forwarded_for=False, login_threshold=-1,
                                       is_ban_enabled=False, use_x_frame_options=True)
         self.assertTrue(await async_setup(self.hass, CONFIG_SCHEMA(
-            {DOMAIN: {'allowed_targets': ['switch.fixture', 'light.fixture', 'light.basic']}})))
+            {DOMAIN: {'allowed_targets': ['switch.fixture', 'light.fixture', 'light.basic'],
+                      **({'stepped_sunrise_targets': self.stepped_targets}
+                         if hasattr(self, 'stepped_targets') else {})}})))
         self.hass.set_state(CoreState.running)
         self.client = TestClient(TestServer(server.app, host='127.0.0.1'))
         await self.client.start_server()
@@ -62,9 +66,9 @@ class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
             self.calls.append((call.service, dict(call.data), call.context.user_id))
             attributes = {'supported_features': 32, 'supported_color_modes': ['brightness']}
             if call.service == 'turn_on':
-                self.hass.states.async_set('light.fixture', 'on', attributes | {'brightness': 3})
+                self.hass.states.async_set('light.fixture', 'on', attributes | {'brightness': 3}, context=call.context)
             else:
-                self.hass.states.async_set('light.fixture', 'off', attributes)
+                self.hass.states.async_set('light.fixture', 'off', attributes, context=call.context)
         self.hass.services.async_register('light', 'turn_on', fake_light)
         self.hass.services.async_register('light', 'turn_off', fake_light)
         self.hass.states.async_set('light.fixture', 'off',
@@ -230,6 +234,55 @@ class HTTPAdapterTests(unittest.IsolatedAsyncioTestCase):
         record = await self.hass.async_add_executor_job(state['store'].get, self.admin.id, saved['remoteID'])
         self.assertEqual(record['state'], 'expired')
 
+    async def start_auto_off_session(self):
+        request = self.request(deviceID='light.fixture', level=0.8, transition=600)
+        request['autoOffAt'] = request['start'] + 600 + 900
+        record = await self.due(request)
+        self.assertEqual(record['state'], 'holding')
+        return record
+
+    async def test_auto_off_dispatches_only_for_its_confirmed_session(self):
+        record = await self.start_auto_off_session()
+        state = self.hass.data[DOMAIN]
+        state['store'].clock = lambda: record['autoOffAt']
+        await state['runtime'].poll()
+        await state['runtime'].poll()
+        self.assertEqual([call[0] for call in self.calls], ['turn_on', 'turn_off'])
+        self.assertEqual(self.calls[-1][1], {'entity_id': 'light.fixture'})
+
+    async def test_foreign_change_then_matching_value_does_not_reacquire_ownership(self):
+        record = await self.start_auto_off_session()
+        old = self.hass.states.get('light.fixture')
+        self.hass.states.async_set('light.fixture', 'on', dict(old.attributes) | {'brightness': 200})
+        self.hass.states.async_set('light.fixture', 'on', dict(old.attributes), context=old.context)
+        await self.hass.async_block_till_done()
+        state = self.hass.data[DOMAIN]
+        state['store'].clock = lambda: record['autoOffAt']
+        await state['runtime'].poll()
+        self.assertEqual([call[0] for call in self.calls], ['turn_on'])
+
+    async def test_same_value_manual_command_revokes_auto_off(self):
+        record = await self.start_auto_off_session()
+        await self.hass.services.async_call('light', 'turn_on', {'entity_id': 'light.fixture'}, blocking=True)
+        await self.hass.async_block_till_done()
+        state = self.hass.data[DOMAIN]
+        state['store'].clock = lambda: record['autoOffAt']
+        await state['runtime'].poll()
+        self.assertNotIn('turn_off', [call[0] for call in self.calls])
+
+
+    async def test_passive_identical_report_preserves_planned_off(self):
+        record = await self.start_auto_off_session()
+        old = self.hass.states.get('light.fixture')
+        # Routine adapter update, no service call and no user action.
+        self.hass.states.async_set('light.fixture', old.state, dict(old.attributes))
+        await self.hass.async_block_till_done()
+        state = self.hass.data[DOMAIN]
+        observed = await self.hass.async_add_executor_job(state['store'].get, self.admin.id, record['remoteID'])
+        print('PASSIVE_REPORT_DIAGNOSTIC state=' + observed['state'])
+        state['store'].clock = lambda: record['autoOffAt']
+        await state['runtime'].poll()
+        self.assertIn('turn_off', [call[0] for call in self.calls])
 
 if __name__ == '__main__':
     unittest.main()

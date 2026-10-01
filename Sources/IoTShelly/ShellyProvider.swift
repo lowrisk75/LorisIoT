@@ -240,3 +240,39 @@ actor ShellyControlCapability: ControlCapability {
         return viaCloud ? receipt(.accepted, nil) : receipt(.rejected, s)
     }
 }
+
+// MARK: - Multi-device wake
+public extension ShellyProvider {
+    /// The host must verify this device/account binding, including the configured relay channel.
+    /// Use a shared serializationKey when multiple logical connections share one physical transport.
+    func wakeAdapter(for target: WakeTargetReference, validateBinding: @escaping @Sendable () async throws -> Bool,
+                     serializationKey: UUID? = nil, now: @escaping @Sendable () -> Date = { Date() }) throws -> OwnedScheduleWakeAdapter {
+        guard target.providerID == id, target.component == nil, configs[target.deviceID] != nil,
+              let owner = scheduleOwner, let store = scheduleStore else { throw IoTError.notConfigured }
+        let scoped = ProviderID(rawValue: "wake-shelly." + target.bindingID.uuidString.lowercased())
+        return OwnedScheduleWakeAdapter(target: target, owner: owner, serializationKey: serializationKey ?? target.connectionID,
+            store: store, scheduleProviderID: scoped, resolve: { [self] in
+                try await self.resolveWake(target, scoped: scoped, validateBinding: validateBinding, now: now)
+            }, now: now)
+    }
+    private func resolveWake(_ target: WakeTargetReference, scoped: ProviderID,
+                             validateBinding: @Sendable () async throws -> Bool,
+                             now: @escaping @Sendable () -> Date) async throws -> (WakeCapabilitySnapshot, any ScheduleCapability) {
+        guard validConfiguration, try await validateBinding(), let config = configs[target.deviceID],
+              let owner = scheduleOwner, let store = scheduleStore else { throw IoTError.notConfigured }
+        let client = ShellyClient(host: config.host, password: config.password, rpc: rpc)
+        let info = try await client.probe()
+        guard info.switchIDs.contains(config.switchID), !config.mac.isEmpty,
+              info.mac.lowercased() == config.mac.lowercased() else { throw IoTError.notConfigured }
+        let methods = await client.listMethods()
+        guard Set(["Schedule.Create", "Schedule.Update", "Schedule.List", "Schedule.Delete", "Sys.GetConfig"]).isSubset(of: methods),
+              qualifiedYearSupport.contains(target.deviceID) || methods.contains("Schedule.Eval"),
+              try await validateBinding() else { throw IoTError.notSupported("No qualified one-shot scheduling path") }
+        let checked = now()
+        let snapshot = try WakeCapabilitySnapshot(target: target, kind: .outlet, availability: .online,
+            manual: [.power, .readState], autonomous: [.power], execution: .device,
+            verifiedCancellation: true, checkedAt: checked, validUntil: checked.addingTimeInterval(30))
+        return (snapshot, ShellyOwnedSchedules(client: client, deviceID: target.deviceID, switchID: config.switchID,
+            owner: owner, store: store, providerID: scoped, supportsYear: qualifiedYearSupport.contains(target.deviceID), now: now))
+    }
+}
