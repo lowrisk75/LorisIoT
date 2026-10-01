@@ -162,7 +162,7 @@ private final class LoopbackWSServer: @unchecked Sendable {
     private let listener: NWListener
     let port: UInt16
 
-    init(response: String? = nil, frames: [Data] = [], rawFrames: Data = Data(), silent: Bool = false) throws {
+    init(response: String? = nil, frames: [Data] = [], rawFrames: Data = Data(), silent: Bool = false) async throws {
         listener = try NWListener(using: .tcp, on: .any)
         listener.newConnectionHandler = { conn in
             conn.start(queue: .global())
@@ -183,12 +183,28 @@ private final class LoopbackWSServer: @unchecked Sendable {
                 conn.send(content: out, completion: .contentProcessed { _ in })
             }
         }
-        let ready = DispatchSemaphore(value: 0)
-        listener.stateUpdateHandler = { if case .ready = $0 { ready.signal() } }
+        // Never block Swift's cooperative executor while Network.framework starts.
+        // Parallel fixtures can otherwise exhaust the small hosted runner thread pool.
+        let states = AsyncThrowingStream<Void, any Error>.makeStream()
+        listener.stateUpdateHandler = { state in
+            switch state {
+            case .ready: states.continuation.yield(()); states.continuation.finish()
+            case .failed(let error): states.continuation.finish(throwing: error)
+            case .cancelled: states.continuation.finish(throwing: CancellationError())
+            default: break
+            }
+        }
         listener.start(queue: .global())
-        guard ready.wait(timeout: .now() + 5) == .success else {
+        do {
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                group.addTask { for try await _ in states.stream { return } }
+                group.addTask { try await Task.sleep(for: .seconds(5)); throw IoTError.timeout }
+                defer { group.cancelAll(); states.continuation.finish() }
+                try await group.next()
+            }
+        } catch {
             listener.cancel()
-            throw IoTError.timeout
+            throw error
         }
         port = listener.port?.rawValue ?? 0
     }
@@ -200,7 +216,7 @@ private final class LoopbackWSServer: @unchecked Sendable {
 
     @Test func handshakesAndReceivesFramesOverRealTCP() async throws {
         let payloads = [Data(#"{"n":1}"#.utf8), Data(#"{"n":2}"#.utf8)]
-        let server = try LoopbackWSServer(frames: payloads)
+        let server = try await LoopbackWSServer(frames: payloads)
         let transport = RawTCPWebSocketTransport(
             url: URL(string: "http://127.0.0.1:\(server.port)/ws")!, connectTimeout: 5)
         try await transport.open()
@@ -211,7 +227,7 @@ private final class LoopbackWSServer: @unchecked Sendable {
     }
 
     @Test func httpsRedirectSurfacesTypedError() async throws {
-        let server = try LoopbackWSServer(
+        let server = try await LoopbackWSServer(
             response: "HTTP/1.1 308 Permanent Redirect\r\nLocation: https://127.0.0.1/ws\r\n\r\n")
         let transport = RawTCPWebSocketTransport(
             url: URL(string: "http://127.0.0.1:\(server.port)/ws")!, connectTimeout: 5)
@@ -221,7 +237,7 @@ private final class LoopbackWSServer: @unchecked Sendable {
     }
 
     @Test func rejectedUpgradeThrowsTransportError() async throws {
-        let server = try LoopbackWSServer(response: "HTTP/1.1 401 Unauthorized\r\n\r\n")
+        let server = try await LoopbackWSServer(response: "HTTP/1.1 401 Unauthorized\r\n\r\n")
         let transport = RawTCPWebSocketTransport(
             url: URL(string: "http://127.0.0.1:\(server.port)/ws")!, connectTimeout: 5)
         do {
@@ -236,14 +252,14 @@ private final class LoopbackWSServer: @unchecked Sendable {
     }
 
     @Test func crossHostUpgradeCannotForwardCredentials() async throws {
-        let server = try LoopbackWSServer(response: "HTTP/1.1 308 Redirect\r\nLocation: https://other.local/ws\r\n\r\n")
+        let server = try await LoopbackWSServer(response: "HTTP/1.1 308 Redirect\r\nLocation: https://other.local/ws\r\n\r\n")
         let transport = RawTCPWebSocketTransport(url: URL(string: "http://127.0.0.1:\(server.port)/ws")!,
                                                 extraHeaders: ["Authorization": "Bearer fixture"])
         await #expect(throws: IoTError.notConfigured) { try await transport.open() }
     }
 
     @Test func fragmentedMessagesRemainWholeAcrossControlFrames() async throws {
-        let server = try LoopbackWSServer(rawFrames: Data([0x01, 2, 104, 101, 0x8A, 0, 0x80, 3, 108, 108, 111]))
+        let server = try await LoopbackWSServer(rawFrames: Data([0x01, 2, 104, 101, 0x8A, 0, 0x80, 3, 108, 108, 111]))
         let transport = RawTCPWebSocketTransport(url: URL(string: "http://127.0.0.1:\(server.port)/ws")!)
         try await transport.open()
         #expect(try await transport.receive() == Data()) // pong liveness
@@ -252,7 +268,7 @@ private final class LoopbackWSServer: @unchecked Sendable {
     }
 
     @Test func silentHTTPUpgradeHasADeadline() async throws {
-        let server = try LoopbackWSServer(silent: true)
+        let server = try await LoopbackWSServer(silent: true)
         let transport = RawTCPWebSocketTransport(url: URL(string: "http://127.0.0.1:\(server.port)/ws")!, connectTimeout: 0.1)
         let start = ContinuousClock.now
         await #expect(throws: (any Error).self) { try await transport.open() }
@@ -261,7 +277,7 @@ private final class LoopbackWSServer: @unchecked Sendable {
 
     @Test func worksAsRealtimeSocketClientTransport() async throws {
         // The whole point: plug into RealtimeSocketClient and stream decoded messages.
-        let server = try LoopbackWSServer(frames: [Data("alpha".utf8), Data("beta".utf8)])
+        let server = try await LoopbackWSServer(frames: [Data("alpha".utf8), Data("beta".utf8)])
         let url = URL(string: "http://127.0.0.1:\(server.port)/ws")!
         let client = RealtimeSocketClient<String>(
             makeTransport: { RawTCPWebSocketTransport(url: url, connectTimeout: 5) },
