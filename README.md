@@ -51,3 +51,11 @@ swift test
 The durable multi-device coordinator and HA/Shelly/HomeKit adapters are documented in
 [Multi-device wake](Docs/MULTI-DEVICE-WAKE.md). One-shot readback, cancellation and recovery are
 fixture-tested; hardware and release qualification remain separate gates.
+
+## Native Matter sensors
+
+`IoTMatter` provides read-only temperature/humidity reads and subscriptions through
+Apple's Matter framework, using an exclusively owned controller supplied by the
+host application. Commissioning and durable fabric storage remain host responsibilities.
+See [Matter sensors](Docs/MATTER-SENSORS.md) for ownership, freshness and physical
+qualification requirements. The module does not expose control or scheduling.
