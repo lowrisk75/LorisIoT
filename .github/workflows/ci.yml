@@ -34,6 +34,11 @@ jobs:
       - name: Build and test
         run: swift test --scratch-path "$RUNNER_TEMP/lorisiot-build"
 
+      - name: CocoaMQTT loopback socket contracts
+        env:
+          LORISIOT_TEST_SCRATCH: ${{ runner.temp }}/lorisiot-build
+        run: python3 Scripts/mqtt/run-loopback-tests.py
+
   home-assistant:
     name: Isolated Home Assistant scheduling contract
     runs-on: ubuntu-24.04
