@@ -6,6 +6,37 @@ upgrade/backup recovery and a sustained final-candidate run remain separate qual
 
 ## Contract
 
+### Optional sunrise session (component 0.3.1)
+
+`GET /health` advertises `sunriseAutoOffVersion: 1`. The SDK's `HASunriseClient`
+requires this capability before sending an immutable `HASunriseRequest` with an
+`autoOffAt` UTC timestamp. The existing schedule API and explicit target allowlist
+are reused; no component is installed automatically. Generic schedule readback
+rejects an unexpected `autoOffAt` obligation.
+
+- One light, a 1–30 minute native ramp (or explicitly enabled HA steps), then OFF 1–180 minutes after the end of
+  the ramp (the wake time). The full session is persisted before acknowledgement.
+- OFF becomes eligible only after a fresh, context-matching ON confirmation.
+  The receipt moves `armed → executing → holding → offExecuting → completed`.
+- A foreign or missing context, unknown/unavailable state, or observed foreign
+  power command permanently relinquishes ownership (`overridden`). Returning to
+  a matching brightness does not restore it. Some integrations do not preserve
+  command context; these conservatively forgo automatic OFF. Physical changes
+  not reported by HA cannot be detected: device qualification is still required.
+- Overlapping sunrise sessions for the same light are refused across owners.
+  Cancellation in `holding` removes OFF without commanding the light. In-flight
+  or uncertain effects never claim successful cancellation.
+- Pending sessions survive restart. **Already-started sessions become uncertain
+  and do not turn the lamp off after restart**, because manual interventions during
+  downtime are unobservable. Late OFF (>5 seconds) is missed, never replayed.
+- SQLite schema 2 migrates transactionally to 3, retaining existing rows. An older
+  component refuses schema 3. Back up and review before a separately authorized
+  deployment; do not downgrade against the migrated journal.
+
+The client must persist the nonce and complete request before `arm`, bind that
+journal to the exact endpoint, and retain unknown/cancellation-pending receipts.
+No timer on the iPhone, credentials in the journal, or guessed server capability.
+
 The custom component persists one-shot intents in a bounded SQLite journal. A timer runs
 inside Home Assistant independently of an app connection. Supported targets are explicit
 `switch`, `light`, `fan` and `input_boolean` entity IDs; only `turn_on` and `turn_off` are accepted.
@@ -13,14 +44,44 @@ There are no area, floor, label, device-group, arbitrary service or webhook sele
 recurring wall-clock schedules are not implemented.
 
 A `light` target may additionally carry a `level` (0 to 1) and a `transition` (0 to 3600 seconds).
-A sunrise ramp is therefore **one atomic command**: the luminaire performs the ramp itself using the
-Zigbee/Matter Level Control transition time, which HA exposes as `light.turn_on { brightness,
-transition }`. Neither the app nor this component ever steps brightness, so a ramp survives a server
-restart in the middle of it. A level or transition requested on a target whose reported
-`supported_color_modes`/`supported_features` cannot perform it is refused at provisioning with
-`target_has_no_brightness`, `target_has_no_transition` or `target_state_unknown` — never silently
-degraded to an instant change at wake time. Both fields are additive and optional: an older client
-omits them, and a newer client that sends them to an older server is refused, never partially applied.
+A native ramp is one command: the luminaire performs the transition itself. Generic schedules
+still require native transition capability and are never silently converted into software steps.
+
+For a brightness-capable light without native transitions, a separately provisioned sunrise
+session (`autoOffAt`) can opt into server-side steps. The target must appear in both lists:
+
+```yaml
+lorisiot_schedule:
+  allowed_targets:
+    - light.selected_lamp
+  stepped_sunrise_targets:
+    - light.selected_lamp
+```
+
+The initial brightness is a nonzero 1% when off; an already-on lamp starts near its reported
+brightness bounded by the desired target. HA increases it every 15 seconds using integer-percent
+steps, up to the requested wake level. Commands use the ceiling of the corresponding 0..255 value
+so a percentage-based adapter does not truncate the first step to zero.
+Polling delays coalesce steps rather than replaying a burst. A final step over five seconds late
+abandons the session. Every step requires a fresh report and retained context. For an explicitly opted-in stepped
+light, the report must fall between the floor and ceiling of that exact percentage in 0..255
+space (fractional reports are accepted). Zero, non-numeric and out-of-bucket reports are rejected;
+this is not a general brightness tolerance. Native transitions retain their existing contract.
+The journal enters `executing` before each service call, serializing the step with cancellation;
+`holding` is restored only after confirmation. A cancellation during a step is unconfirmed.
+
+A foreign state report or command, including a same-value report with a foreign event context,
+revokes steps and automatic OFF. A timeout keeps its concurrency slot until the service actually
+finishes. The executor allows eight outstanding steps; it never retries an uncertain step.
+Started software ramps are not reconstructed after restart; the journal becomes uncertain and
+neither later steps nor OFF are replayed. Pending future sessions still survive a restart.
+
+`POST /retire` accepts a complete sunrise request only after its OFF deadline and lateness
+allowance have passed. If its nonce is absent, the server durably writes a `removed` tombstone.
+It never replaces an existing live, uncertain, or mismatching receipt. The Swift client requires
+exact acknowledgement and GET readback before accepting this as cancellation; a bare 404 is
+still insufficient. This allows a never-created, elapsed session to be reconciled after installing
+the previously missing component, while retaining the original request and its history.
 
 Both read and write endpoints require a currently active HA administrator. At execution time,
 the user and exact target are checked again. The owner app/installation identifies intent
@@ -106,7 +167,7 @@ uv pip install --python /private/tmp/lorisiot-ha-qualification/bin/python -r Ser
 ```
 
 These commands are for test preparation, not deployment. The integration's manifest is version
-0.1.0 and the internal SQLite schema is version 2. Other existing journal versions are rejected,
+0.3.1 and the internal SQLite schema is version 3 (with additive migration from 2). Other existing journal versions are rejected,
 never reset. Enabling this component on a real home requires separate deployment authorization
 and device-specific acceptance. Existing television, plug and home schedules must be preserved.
 
@@ -118,3 +179,37 @@ and device-specific acceptance. Existing television, plug and home schedules mus
 - [HA async and executor guidance](https://developers.home-assistant.io/docs/asyncio_working_with_async/)
 - [SQLite atomic commit](https://www.sqlite.org/atomiccommit.html)
 - [SQLite synchronous policy](https://www.sqlite.org/pragma.html#pragma_synchronous)
+
+## Qualification 2026-09-23
+
+The stepped-sunrise suite was run with real Home Assistant **2026.9.0b2**, matching the target
+server, using synthetic services and a temporary localhost instance. To select this explicit lane:
+
+```sh
+LORISIOT_HA_TEST_VERSION=2026.9.0b2 python -B -m unittest discover -s Server/HomeAssistant/integration_tests -v
+```
+
+This proves adapter behaviour against HA; physical device response and context retention still
+require an actual-device test. An integration that drops service contexts is conservatively refused
+continued ownership rather than receiving guessed follow-up brightness or OFF commands.
+
+
+## Gentle wake profile (local 0.4.0 implementation)
+
+`sunriseProfile: "gentle-v1"` is opt-in for owned sunrise sessions only. Health advertises
+`gentleSunriseVersion: 1`; older servers must be refused by clients before provisioning.
+The target must be explicitly listed in `stepped_sunrise_targets`, including when it also
+supports native transitions. Existing sessions without this field keep their original behavior.
+
+The profile uses a squared brightness progression to the requested level. When the fresh
+light capabilities expose color temperature and finite bounds, it requests 2200–3000 K,
+clamped to those bounds. Brightness-only lights remain brightness-only. A reported value
+outside the commanded bounds is unconfirmed; no blind replay is used.
+
+After wake, brightness is held, then lowered over the last two minutes before `autoOffAt`
+(or half the post-wake interval if shorter). The existing owned OFF transaction remains
+sole owner of the final off command. Manual takeover, missing confirmation, missed ramp
+completion or restart revokes further progression; no started ramp is reconstructed.
+No clinical sleep claim or physical qualification is implied by synthetic tests.
+
+No existing home configuration is migrated or deployed by this source change.

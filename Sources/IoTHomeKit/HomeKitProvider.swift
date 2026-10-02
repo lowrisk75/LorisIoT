@@ -134,3 +134,32 @@ actor HomeKitReadStateCapability: ReadStateCapability {
         homeKitState(try await provider.readPower(deviceID), id: deviceID, seq: await seq.next())
     }
 }
+
+// MARK: - Multi-device wake
+public extension HomeKitProvider {
+    /// Bind this provider to one explicit home. The host validates current home/permission identity.
+    func wakeAdapter(for target: WakeTargetReference, validateBinding: @escaping @Sendable () async throws -> Bool,
+                     serializationKey: UUID? = nil, now: @escaping @Sendable () -> Date = { Date() }) throws -> OwnedScheduleWakeAdapter {
+        guard target.providerID == id, target.component == nil, let owner, let store else { throw IoTError.notConfigured }
+        let scoped = ProviderID(rawValue: "wake-homekit." + target.bindingID.uuidString.lowercased())
+        return OwnedScheduleWakeAdapter(target: target, owner: owner, serializationKey: serializationKey ?? target.connectionID,
+            store: store, scheduleProviderID: scoped, resolve: { [self] in
+                try await self.resolveWake(target, scoped: scoped, validateBinding: validateBinding, now: now)
+            }, now: now)
+    }
+    private func resolveWake(_ target: WakeTargetReference, scoped: ProviderID,
+                             validateBinding: @Sendable () async throws -> Bool,
+                             now: @escaping @Sendable () -> Date) async throws -> (WakeCapabilitySnapshot, any ScheduleCapability) {
+        guard try await validateBinding(), let owner, let store,
+              let device = try await transport.devices().first(where: { $0.id == target.deviceID }),
+              device.writable, device.readable, device.supportsTimers else { throw IoTError.notConfigured }
+        _ = try await transport.readPower(target.deviceID)
+        guard try await validateBinding() else { throw IoTError.notConfigured }
+        let checked = now()
+        let snapshot = try WakeCapabilitySnapshot(target: target, kind: device.kind, availability: .online,
+            manual: [.power, .readState], autonomous: [.power], execution: .device,
+            verifiedCancellation: true, checkedAt: checked, validUntil: checked.addingTimeInterval(30), minLead: 60, timeQuantum: 60)
+        return (snapshot, HomeKitOwnedSchedules(transport: transport, deviceID: target.deviceID,
+            owner: owner, store: store, providerID: scoped, now: now))
+    }
+}

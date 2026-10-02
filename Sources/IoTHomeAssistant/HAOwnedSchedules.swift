@@ -23,6 +23,8 @@ struct HAScheduleHealth: Decodable, Sendable {
     let maxLateSeconds: Double
     let durable: Bool
     let executionPolicy: String
+    let sunriseAutoOffVersion: Int?
+    let gentleSunriseVersion: Int?
 }
 
 struct HAScheduleRequest: Codable, Equatable, Sendable {
@@ -37,6 +39,8 @@ struct HAScheduleRequest: Codable, Equatable, Sendable {
     let level: Double?
     let transition: Double?
     let expiresAt: Double?
+    // A generic power schedule must never accept an injected sunrise OFF obligation on readback.
+    let autoOffAt: Double?
 
     // The lease is renewed on every push, so it does not take part in exact equality. It is checked
     // separately: a server that shortens it can only prevent a firing, but one that drops or extends it
@@ -51,7 +55,7 @@ struct HAScheduleRequest: Codable, Equatable, Sendable {
         l.remoteID == r.remoteID && l.owner == r.owner && l.providerID == r.providerID
             && l.scheduleID == r.scheduleID && l.deviceID == r.deviceID && l.on == r.on
             && l.start == r.start && l.enabled == r.enabled && l.level == r.level
-            && l.transition == r.transition
+            && l.transition == r.transition && l.autoOffAt == r.autoOffAt
     }
 
     init(schedule: DeviceSchedule, remoteID: UUID, owner: ScheduleOwner, providerID: ProviderID,
@@ -85,7 +89,7 @@ struct HAScheduleRequest: Codable, Equatable, Sendable {
         self.providerID = providerID.rawValue; scheduleID = schedule.id.rawValue
         deviceID = schedule.deviceID.rawValue; self.on = on
         start = schedule.start.timeIntervalSince1970; enabled = schedule.isEnabled
-        self.level = level; transition = schedule.transition; self.expiresAt = expiresAt
+        self.level = level; transition = schedule.transition; self.expiresAt = expiresAt; autoOffAt = nil
     }
 }
 

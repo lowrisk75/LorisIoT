@@ -17,6 +17,8 @@ let package = Package(
         .library(name: "IoTShelly", targets: ["IoTShelly"]),
         .library(name: "IoTGovee", targets: ["IoTGovee"]),
         .library(name: "IoTMeross", targets: ["IoTMeross"]),
+        .library(name: "IoTDreo", targets: ["IoTDreo"]),
+        .library(name: "IoTSmartThings", targets: ["IoTSmartThings"]),
         .library(name: "IoTMQTT", targets: ["IoTMQTT"]),
         // Real broker transport (CocoaMQTT, research #18) — isolated so IoTMQTT stays dep-free.
         .library(name: "IoTMQTTCocoa", targets: ["IoTMQTTCocoa"]),
@@ -29,6 +31,10 @@ let package = Package(
         .package(url: "https://github.com/emqx/CocoaMQTT", from: "2.4.0"),
     ],
     targets: [
+        .target(name: "IoTDreo", dependencies: ["IoTCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
+        .testTarget(name: "IoTDreoTests", dependencies: ["IoTDreo"], swiftSettings: [.swiftLanguageMode(.v6)]),
+        .target(name: "IoTSmartThings", dependencies: ["IoTCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
+        .testTarget(name: "IoTSmartThingsTests", dependencies: ["IoTSmartThings"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .target(name: "IoTGovee", dependencies: ["IoTCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "IoTGoveeTests", dependencies: ["IoTGovee"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .target(name: "IoTMeross", dependencies: ["IoTCore"], swiftSettings: [.swiftLanguageMode(.v6)]),

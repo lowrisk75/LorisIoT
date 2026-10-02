@@ -213,41 +213,65 @@ import IoTCore
     }
 
     /// The refusal must be lifted by a reconnect, or the app would never get live updates back.
-    @Test func connectingAgainAfterADisconnectRestoresSubscriptions() async throws {
-        let transport = HAIdleTransport()
+    /// Each session owns a fresh transport: a late close of the old socket must not close the new fixture.
+    @Test(arguments: 0..<32) func connectingAgainAfterADisconnectRestoresSubscriptions(iteration: Int) async throws {
         let opens = AttemptCounter()
         let provider = HomeAssistantProvider(config: HAConfig(baseURL: URL(string: "https://ha.invalid")!), token: "fixture",
             http: MockHTTP { _, _, _ in (Data(#"{"message":"API running."}"#.utf8), 200) },
-            makeTransport: { _ = await opens.next(); return transport })
+            makeTransport: { _ = await opens.next(); return HAIdleTransport() })
         try await provider.connect()
         let subscribe = try #require(try await provider.capabilities(for: "switch.first").subscribe)
-        try await Self.firstSnapshot(await subscribe.stateChanges())
+        try await Self.firstLiveSnapshot(await subscribe.stateChanges())
         await provider.disconnect()
         let opensAtDisconnect = await opens.current()
         try await provider.connect()
-        try await Self.firstSnapshot(await subscribe.stateChanges())
+        try await Self.firstLiveSnapshot(await subscribe.stateChanges())
         #expect(await opens.current() == opensAtDisconnect + 1, "the reconnect did not open exactly one socket")
     }
 
     /// Closing the last view is not a disconnect: a later subscription must still work without connect().
     @Test func closingTheLastViewDoesNotBlockLaterSubscriptions() async throws {
         let transport = HAIdleTransport()
+        let opens = AttemptCounter()
         let provider = HomeAssistantProvider(config: HAConfig(baseURL: URL(string: "https://ha.invalid")!), token: "fixture",
             http: MockHTTP { _, _, _ in (Data(#"{"message":"API running."}"#.utf8), 200) },
-            makeTransport: { transport })
+            makeTransport: { await opens.next() == 1 ? transport : HAIdleTransport() })
         let subscribe = try #require(try await provider.capabilities(for: "switch.first").subscribe)
-        try await Self.firstSnapshot(await subscribe.stateChanges())   // the stream ends here, last view closed
+        try await Self.firstLiveSnapshot(await subscribe.stateChanges())   // the stream ends here, last view closed
         #expect(await transport.waitUntilClosed())
-        try await Self.firstSnapshot(await subscribe.stateChanges())   // never connected explicitly
+        try await Self.firstLiveSnapshot(await subscribe.stateChanges())   // never connected explicitly
     }
 
-    /// Consumes a stream until its first snapshot, then lets it end.
-    private static func firstSnapshot(_ stream: AsyncThrowingStream<DeviceStateChange, any Error>) async throws {
-        try await withThrowingTaskGroup(of: Void.self) { group in
-            group.addTask { for try await change in stream { if case .snapshot = change { return } } }
+    @Test func reconnectWaitDoesNotAcceptCachedSnapshots() async throws {
+        let cached = DeviceState(deviceID: "switch.first", availability: .offline, observedAt: Date(),
+            origin: .cache, revision: .init(localSequence: 1))
+        let staleOnline = DeviceState(deviceID: "switch.first", availability: .online, observedAt: Date(),
+            origin: .cache, revision: .init(localSequence: 1))
+        let fresh = DeviceState(deviceID: "switch.first", availability: .online, observedAt: Date(),
+            origin: .bridge, revision: .init(localSequence: 2))
+        let stream = AsyncThrowingStream<DeviceStateChange, any Error> { continuation in
+            continuation.yield(.snapshot(cached))
+            continuation.yield(.snapshot(staleOnline))
+            continuation.yield(.snapshot(fresh))
+            continuation.finish()
+        }
+        #expect(try await Self.firstLiveSnapshot(stream) == fresh)
+    }
+
+    /// Cached snapshots are useful UI data, but do not prove a restored live subscription.
+    @discardableResult
+    private static func firstLiveSnapshot(_ stream: AsyncThrowingStream<DeviceStateChange, any Error>) async throws -> DeviceState {
+        try await withThrowingTaskGroup(of: DeviceState.self) { group in
+            group.addTask {
+                for try await change in stream {
+                    if case .snapshot(let state) = change, state.availability == .online, state.origin != .cache { return state }
+                }
+                throw IoTError.unconfirmed
+            }
             group.addTask { try await Task.sleep(for: .seconds(3)); throw IoTError.timeout }
             defer { group.cancelAll() }
-            try await group.next()
+            guard let state = try await group.next() else { throw IoTError.unconfirmed }
+            return state
         }
     }
 
