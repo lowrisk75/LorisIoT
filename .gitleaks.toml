@@ -1,0 +1,17 @@
+title = "LorisIoT secret scanning"
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Public Meross client signing constant, not an account credential"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^Sources/IoTMeross/Cloud/MerossCloudModels\.swift$''']
+regexes = ['''^23x17ahWarFH6w29$''']
+
+[[allowlists]]
+description = "RFC 6455 known-answer handshake vector"
+condition = "AND"
+targetRules = ["generic-api-key"]
+paths = ['''^Tests/IoTCoreTests/RawTCPWebSocketTests\.swift$''']
+regexes = ['''^dGhlIHNhbXBsZSBub25jZQ==$''']
