@@ -24,6 +24,7 @@ let package = Package(
         .library(name: "IoTMQTTCocoa", targets: ["IoTMQTTCocoa"]),
         .library(name: "IoTWebhook", targets: ["IoTWebhook"]),
         .library(name: "IoTHomeKit", targets: ["IoTHomeKit"]),
+        .library(name: "IoTMatter", targets: ["IoTMatter"]),
     ],
     dependencies: [
         // Locked by research #18 (battle-tested MQTT 5.0, Swift 6-clean). Wrapped — CocoaMQTT
@@ -31,6 +32,8 @@ let package = Package(
         .package(url: "https://github.com/emqx/CocoaMQTT", from: "2.4.0"),
     ],
     targets: [
+        .target(name: "IoTMatter", dependencies: ["IoTCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
+        .testTarget(name: "IoTMatterTests", dependencies: ["IoTMatter"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .target(name: "IoTDreo", dependencies: ["IoTCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .testTarget(name: "IoTDreoTests", dependencies: ["IoTDreo"], swiftSettings: [.swiftLanguageMode(.v6)]),
         .target(name: "IoTSmartThings", dependencies: ["IoTCore"], swiftSettings: [.swiftLanguageMode(.v6)]),
