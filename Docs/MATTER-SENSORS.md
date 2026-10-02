@@ -6,11 +6,12 @@ Matter framework. No control or scheduling capability is exposed.
 
 ## Host integration
 
-The host application commissions devices, creates its fabric, persists its fabric
-identity and credentials, and supplies a running `MTRDeviceController`. This module
-does not implement commissioning UI, discover Apple Home pairings, or obtain access
-to an existing HomeKit fabric. A device already in Apple Home must separately admit
-the application's fabric using the appropriate Matter commissioning flow.
+The host can use [MatterFabric](MATTER-COMMISSIONING.md) to create/reopen a persistent
+fabric and commission an already networked device, or supply its own running
+`MTRDeviceController`. The module does not implement a scanner/system commissioning
+UI, discover Apple Home pairings, or obtain access to an existing HomeKit fabric.
+A device already in Apple Home must separately admit the application's fabric
+through an explicitly opened commissioning window.
 
 ```swift
 import IoTMatter
@@ -27,7 +28,8 @@ let capability = try await provider.capabilities(for: sensors[0].id)
 let state = try await capability.readState?.state()
 ```
 
-The `hostFabric` call above represents application code, not another SDK API.
+The `hostFabric` call above represents application code. Alternatively, use the
+managed [MatterFabric flow](MATTER-COMMISSIONING.md).
 The factory transfers **exclusive controller ownership**. Do not return a controller
 shared with another subsystem. Disconnect shuts down this controller and its
 subscriptions, but does not remove pairings or erase host-owned credentials. On
@@ -70,9 +72,10 @@ grant a control or autonomous scheduling capability.
 Swift tests cover decoding, identities, capability limits, freshness, partial
 reports, out-of-order reads, disconnect, connection recovery, callback loss and
 cancellation. These are software contracts. Physical Matter qualification still
-requires host commissioning, a real sensor, sleepy-device/reconnect observations
-and a signed app networking/permission check. This module alone does not qualify
-an application release or create a standalone commissioner.
+requires a real sensor, sleepy-device/reconnect observations and a signed app
+networking/permission check. The native commissioning driver is implemented; system
+UI and initial Wi-Fi/Thread provisioning remain host integration work. The module
+does not qualify an application release.
 
 Apple references: [Matter](https://developer.apple.com/documentation/matter),
 [Onboarding](https://developer.apple.com/documentation/matter/onboarding-a-matter-device),

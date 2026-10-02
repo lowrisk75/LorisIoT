@@ -55,7 +55,9 @@ fixture-tested; hardware and release qualification remain separate gates.
 ## Native Matter sensors
 
 `IoTMatter` provides read-only temperature/humidity reads and subscriptions through
-Apple's Matter framework, using an exclusively owned controller supplied by the
-host application. Commissioning and durable fabric storage remain host responsibilities.
+Apple's Matter framework, using an exclusively owned controller. The managed
+[MatterFabric flow](Docs/MATTER-COMMISSIONING.md) adds device-only Keychain fabric
+storage and on-network commissioning. Scan/system UI and initial network provisioning
+remain host responsibilities.
 See [Matter sensors](Docs/MATTER-SENSORS.md) for ownership, freshness and physical
 qualification requirements. The module does not expose control or scheduling.
