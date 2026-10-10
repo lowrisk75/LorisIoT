@@ -9,10 +9,24 @@ public enum GoveeLANCommand: Equatable, Sendable {
     case rgb(red: Int, green: Int, blue: Int)
     case temperature(kelvin: Int)
 
+    /// A colour with brightness is two absolute setters, confirmed together by one status read.
+    public static func commands(for payload: CommandPayload) throws -> [Self] {
+        if case .setColor(let color, let level) = payload {
+            var frames: [Self] = [.rgb(red: Int(color.red), green: Int(color.green), blue: Int(color.blue))]
+            if let level { frames.append(.brightness(level.percent)) }
+            for frame in frames { _ = try frame.encoded() }
+            return frames
+        }
+        return [try Self(payload: payload)]
+    }
+
     public init(payload: CommandPayload) throws {
         switch payload {
         case .setPower(let value): self = .power(value)
         case .setLevel(let value): self = .brightness(value.percent)
+        case .setColor(let color, let level):
+            guard level == nil else { throw IoTError.notSupported("Use commands(for:) for Govee colour with brightness") }
+            self = .rgb(red: Int(color.red), green: Int(color.green), blue: Int(color.blue))
         case .setAttribute(name: "colorTemperature", value: .integer(let value)):
             guard let kelvin = Int(exactly: value) else { throw IoTError.invalidResponse }
             self = .temperature(kelvin: kelvin)

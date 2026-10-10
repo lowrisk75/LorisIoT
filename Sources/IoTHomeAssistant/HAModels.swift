@@ -8,11 +8,12 @@ public struct HAEntityState: Sendable, Equatable, Decodable {
     public let state: String
     public let friendlyName: String?
     public let brightness: Int?     // HA reports 0…255
+    public let rgbColor: [Int]?     // HA reports [r, g, b] when the light is on and supports colour
     public let lastUpdated: Date?
     public let unitOfMeasurement: String?
 
     enum CodingKeys: String, CodingKey { case entityID = "entity_id", state, attributes, lastUpdated = "last_updated" }
-    enum AttrKeys: String, CodingKey { case friendlyName = "friendly_name", brightness, unitOfMeasurement = "unit_of_measurement" }
+    enum AttrKeys: String, CodingKey { case friendlyName = "friendly_name", brightness, rgbColor = "rgb_color", unitOfMeasurement = "unit_of_measurement" }
 
     public init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
@@ -25,15 +26,16 @@ public struct HAEntityState: Sendable, Equatable, Decodable {
         if let a = try? c.nestedContainer(keyedBy: AttrKeys.self, forKey: .attributes) {
             friendlyName = try? a.decodeIfPresent(String.self, forKey: .friendlyName)
             brightness = try? a.decodeIfPresent(Int.self, forKey: .brightness)
+            rgbColor = try? a.decodeIfPresent([Int].self, forKey: .rgbColor)
             unitOfMeasurement = try? a.decodeIfPresent(String.self, forKey: .unitOfMeasurement)
         } else {
-            friendlyName = nil; brightness = nil; unitOfMeasurement = nil
+            friendlyName = nil; brightness = nil; rgbColor = nil; unitOfMeasurement = nil
         }
     }
 
-    public init(entityID: String, state: String, friendlyName: String? = nil, brightness: Int? = nil, lastUpdated: Date? = nil,
+    public init(entityID: String, state: String, friendlyName: String? = nil, brightness: Int? = nil, rgbColor: [Int]? = nil, lastUpdated: Date? = nil,
                 unitOfMeasurement: String? = nil) {
-        self.entityID = entityID; self.state = state; self.friendlyName = friendlyName; self.brightness = brightness
+        self.entityID = entityID; self.state = state; self.friendlyName = friendlyName; self.brightness = brightness; self.rgbColor = rgbColor
         self.lastUpdated = lastUpdated
         self.unitOfMeasurement = unitOfMeasurement
     }
@@ -50,6 +52,9 @@ public struct HAEntityState: Sendable, Equatable, Decodable {
         if let brightness {
             let pct = Int((Double(brightness) / 255.0 * 100).rounded())
             attrs["level"] = StateAttribute(value: .integer(Int64(pct)), unit: .percent, displayName: "Brightness")
+        }
+        if let rgbColor, rgbColor.count == 3, rgbColor.allSatisfy({ (0...255).contains($0) }) {
+            attrs["color"] = StateAttribute(value: .array(rgbColor.map { .integer(Int64($0)) }), displayName: "Colour")
         }
         return DeviceState(deviceID: DeviceID(rawValue: entityID), availability: available,
                            primaryValue: primary, primaryUnit: UnitSymbol.from(symbol: unitOfMeasurement),

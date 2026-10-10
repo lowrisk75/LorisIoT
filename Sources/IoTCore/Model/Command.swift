@@ -29,9 +29,21 @@ public enum CommandReplayPolicy: Codable, Hashable, Sendable {
     case idempotencyKey(String)
 }
 
+/// sRGB colour, 0…255 per channel, as lamps and Home Assistant express it.
+public struct RGBColor: Codable, Hashable, Sendable {
+    public let red: UInt8, green: UInt8, blue: UInt8
+    public init(red: UInt8, green: UInt8, blue: UInt8) { self.red = red; self.green = green; self.blue = blue }
+    /// Largest per-channel difference, for confirm-by-reread tolerance.
+    public func maxChannelDistance(to other: RGBColor) -> Int {
+        max(abs(Int(red) - Int(other.red)), abs(Int(green) - Int(other.green)), abs(Int(blue) - Int(other.blue)))
+    }
+}
+
 public enum CommandPayload: Codable, Hashable, Sendable {
     case setPower(Bool)
     case setLevel(UnitInterval)
+    /// Colour and, when given, level in one command (one round trip, one readback).
+    case setColor(RGBColor, level: UnitInterval?)
     case setAttribute(name: String, value: StateValue)
     case invokeAction(name: String, arguments: [String: StateValue])
 }
@@ -64,6 +76,19 @@ public struct SetLevelCommand: DeviceCommand {
     public init(id: CommandID = CommandID(), deviceID: DeviceID, level: UnitInterval,
                 replayPolicy: CommandReplayPolicy = .replaySafe) {
         self.id = id; self.deviceID = deviceID; self.level = level; self.replayPolicy = replayPolicy
+    }
+}
+
+public struct SetColorCommand: DeviceCommand {
+    public let id: CommandID
+    public let deviceID: DeviceID
+    public let color: RGBColor
+    public let level: UnitInterval?
+    public let replayPolicy: CommandReplayPolicy
+    public var payload: CommandPayload { .setColor(color, level: level) }
+    public init(id: CommandID = CommandID(), deviceID: DeviceID, color: RGBColor, level: UnitInterval? = nil,
+                replayPolicy: CommandReplayPolicy = .replaySafe) {
+        self.id = id; self.deviceID = deviceID; self.color = color; self.level = level; self.replayPolicy = replayPolicy
     }
 }
 

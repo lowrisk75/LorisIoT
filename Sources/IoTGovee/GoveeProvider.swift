@@ -58,7 +58,7 @@ public actor GoveeProvider: DeviceProvider {
         metadata: ["delivery": .string("shared-polling"), "buffer": .integer(1)])
     private static let controlModels: Set<String> = ["H6022", "H61E6"]
     private static let controlDescriptor = CapabilityDescriptor(id: .control, operations: [.control],
-        metadata: ["commands": .array([.string("setPower"), .string("setLevel"),
+        metadata: ["commands": .array([.string("setPower"), .string("setLevel"), .string("setColor"),
             .string("color"), .string("colorTemperature")]), "requestCorrelation": .bool(false)])
     private static let readDescriptor = CapabilityDescriptor(id: .readState, operations: [.readState],
         metadata: ["transport": .string("lan-udp"), "authenticated": .bool(false),
@@ -208,16 +208,19 @@ public actor GoveeProvider: DeviceProvider {
         guard command.deviceID == expectedID,
               let config = configs.first(where: { $0.id == expectedID }) else { throw IoTError.notConfigured }
         guard canControl(config), let controlClient else { throw IoTError.notSupported("Govee model control") }
-        let encoded = try GoveeLANCommand(payload: command.payload)
+        let encoded = try GoveeLANCommand.commands(for: command.payload)
         let epoch = generation
         try await acquireForeground(epoch: epoch)
         defer { busy = false; pendingControl = nil }
         try await verify(config, epoch: epoch)
         try requireCurrent(epoch)
-        let send = Task { try await controlClient.send(encoded, host: config.host) }
-        pendingControl = send
         do {
-            try await withTaskCancellationHandler { try await send.value } onCancel: { send.cancel() }
+            for frame in encoded {
+                try requireCurrent(epoch)
+                let send = Task { try await controlClient.send(frame, host: config.host) }
+                pendingControl = send
+                try await withTaskCancellationHandler { try await send.value } onCancel: { send.cancel() }
+            }
             try requireCurrent(epoch)
             guard case .status(let status) = try await exchange(.status, host: config.host, epoch: epoch) else {
                 throw IoTError.invalidResponse
@@ -225,7 +228,7 @@ public actor GoveeProvider: DeviceProvider {
             // Matching content is useful, but without a transaction ID even this read can
             // be a delayed UDP packet. Do not label it applied or automatically replay it.
             return CommandReceipt(commandID: command.id, deviceID: expectedID,
-                outcome: encoded.matches(status) ? .accepted : .uncertain,
+                outcome: encoded.allSatisfy { $0.matches(status) } ? .accepted : .uncertain,
                 state: makeState(status, id: expectedID))
         } catch {
             // Once dispatch starts, cancellation/timeout/disconnect cannot prove non-delivery.

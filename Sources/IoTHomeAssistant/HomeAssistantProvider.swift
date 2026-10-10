@@ -234,8 +234,23 @@ actor HAControlCapability: ControlCapability {
             let confirmed = sent == 0 ? s.isOn == false
                 : s.isOn == true && s.brightness.map { abs($0 - expected) <= 1 } == true
             return receipt(confirmed ? .applied : .rejected, s.deviceState(sequence: await seq.next()))
+        case .setColor(let color, let level):
+            guard domain == "light" else { throw IoTError.notSupported("Colour requires a light") }
+            var data: [String: any Sendable] = ["rgb_color": [Int(color.red), Int(color.green), Int(color.blue)]]
+            if let level { data["brightness_pct"] = level.percent }
+            do { try await rest.callService(domain: domain, service: "turn_on", entityID: deviceID.rawValue, data: data) }
+            catch let e as IoTError where Self.provesNotExecuted(e) { throw e }
+            catch { return receipt(.uncertain, nil) }
+            let s: HAEntityState
+            do { s = try await rest.state(entityID: deviceID.rawValue) }
+            catch { return receipt(.uncertain, nil) }
+            // Lamps quantise colour (some only expose hs/xy and convert back): accept a small per-channel drift.
+            let observed = s.rgbColor.flatMap { $0.count == 3 && $0.allSatisfy({ (0...255).contains($0) }) ? RGBColor(red: UInt8(clamping: $0[0]), green: UInt8(clamping: $0[1]), blue: UInt8(clamping: $0[2])) : nil }
+            let colorOK = observed.map { $0.maxChannelDistance(to: color) <= 8 } ?? false
+            let levelOK = level.map { l in s.brightness.map { abs($0 - Int((Double(l.percent) * 255 / 100).rounded())) <= 1 } ?? false } ?? true
+            return receipt(s.isOn == true && colorOK && levelOK ? .applied : .rejected, s.deviceState(sequence: await seq.next()))
         default:
-            throw IoTError.notSupported("HA control supports power/level")
+            throw IoTError.notSupported("HA control supports power/level/colour")
         }
     }
 }

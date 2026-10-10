@@ -15,6 +15,7 @@ enum MerossCommandEncoder {
         guard profile.canControl else { throw IoTError.notSupported("Meross control") }
         let ch = MerossJSON.number(Double(channel))
         switch (profile.family, payload) {
+        case (_, .setColor): throw IoTError.notSupported("Meross colour is not encoded in this version")
         case (.toggleX, .setPower(let on)), (.light, .setPower(let on)):
             return .init(namespace: MerossNamespace.toggleX, payload: .object(["togglex": .object(["channel": ch, "onoff": .number(on ? 1 : 0)])]), readBack: ["power": .bool(on)])
         case (.toggle, .setPower(let on)):
