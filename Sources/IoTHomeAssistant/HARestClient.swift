@@ -82,6 +82,24 @@ public actor HARestClient {
         return data
     }
 
+    /// The area (room) Home Assistant files each entity under, by `POST /api/template`. An entity without an area is
+    /// absent from the result. Home Assistant reserves this endpoint to administrators: a refusal is an auth failure,
+    /// and the caller carries on without rooms.
+    public func areaNames(entityIDs: [String]) async throws -> [String: String] {
+        let ids = entityIDs.filter(Self.isEntityID)
+        guard !ids.isEmpty else { return [:] }
+        // Entity IDs are [a-z0-9_.] only (checked above), so they cannot leave the quoted list.
+        let list = ids.map { "'\($0)'" }.joined(separator: ",")
+        let template = "{% set ns = namespace(d={}) %}{% for e in [\(list)] %}{% set a = area_name(e) %}"
+            + "{% if a %}{% set ns.d = dict(ns.d, **{e: a}) %}{% endif %}{% endfor %}{{ ns.d | tojson }}"
+        let payload = try JSONSerialization.data(withJSONObject: ["template": template])
+        let (data, status) = try await http.send(method: "POST", path: "api/template", body: payload)
+        try Self.check(status)
+        guard let found = try? JSONDecoder().decode([String: String].self, from: data) else { throw IoTError.invalidResponse }
+        let asked = Set(ids)
+        return found.filter { asked.contains($0.key) && !$0.value.isEmpty }
+    }
+
     /// Set an `input_datetime` helper — the server-side pre-provisioning primitive for scheduled wakes.
     public func setInputDatetime(entityID: String, isoDate: String) async throws {
         guard Self.isEntityID(entityID), entityID.hasPrefix("input_datetime.") else { throw IoTError.notConfigured }
