@@ -87,6 +87,12 @@ public actor HomeAssistantProvider: DeviceProvider {
             canSchedule: schedulable.contains(DeviceID(rawValue: $0.entityID))) }
     }
 
+    /// The room Home Assistant files each device under. A device without a room is absent.
+    public func rooms(for deviceIDs: [DeviceID]) async throws -> [DeviceID: String] {
+        let names = try await rest.areaNames(entityIDs: deviceIDs.map(\.rawValue))
+        return Dictionary(uniqueKeysWithValues: names.map { (DeviceID(rawValue: $0.key), $0.value) })
+    }
+
     /// Per-device typed capability handles — no casts on the consumer side.
     public func capabilities(for deviceID: DeviceID) async throws -> DeviceCapabilitySet {
         guard HARestClient.isEntityID(deviceID.rawValue) else { throw IoTError.notConfigured }
